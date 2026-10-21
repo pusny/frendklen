@@ -71,12 +71,14 @@ def _init_db():
             anon_until TEXT,
             anon_free_date TEXT,
             anon_free_used INTEGER DEFAULT 0,
-            created_at TEXT
+            created_at TEXT,
+            last_seen TEXT
         );
         CREATE TABLE IF NOT EXISTS profiles (
             user_id INTEGER PRIMARY KEY,
             name TEXT, age TEXT, city TEXT, diagnosis TEXT, about TEXT,
-            approved INTEGER DEFAULT 0, rejected INTEGER DEFAULT 0
+            approved INTEGER DEFAULT 0, rejected INTEGER DEFAULT 0,
+            inactive INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS anon_queue (
             user_id INTEGER PRIMARY KEY, ts TEXT, msg_id INTEGER
@@ -93,6 +95,12 @@ def _init_db():
         cols_u = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
         if "full_name" not in cols_u:
             conn.execute("ALTER TABLE users ADD COLUMN full_name TEXT")
+        if "last_seen" not in cols_u:
+            conn.execute("ALTER TABLE users ADD COLUMN last_seen TEXT")
+
+        cols_p = {r[1] for r in conn.execute("PRAGMA table_info(profiles)").fetchall()}
+        if "inactive" not in cols_p:
+            conn.execute("ALTER TABLE profiles ADD COLUMN inactive INTEGER DEFAULT 0")
 
         cols_q = {r[1] for r in conn.execute("PRAGMA table_info(anon_queue)").fetchall()}
         if "msg_id" not in cols_q:
@@ -156,24 +164,26 @@ def db_get_user(uid, tg_user=None):
     with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        
         if not row:
-            now = datetime.now(timezone.utc)
             conn.execute(
-                "INSERT OR IGNORE INTO users(user_id,created_at,likes_date,anon_free_date) VALUES(?,?,?,?)",
-                (uid, now.isoformat(), now.date().isoformat(), now.date().isoformat()),
+                "INSERT OR IGNORE INTO users(user_id,created_at,likes_date,anon_free_date,last_seen) VALUES(?,?,?,?,?)",
+                (uid, now_iso, now_iso[:10], now_iso[:10], now_iso),
             )
             conn.commit()
             row = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+            
         if tg_user is not None:
             uname = tg_user.username
             fname = (tg_user.full_name or "").strip() or None
-            if row["username"] != uname or row["full_name"] != fname:
-                conn.execute(
-                    "UPDATE users SET username=?, full_name=? WHERE user_id=?",
-                    (uname, fname, uid),
-                )
-                conn.commit()
-                row = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+            conn.execute(
+                "UPDATE users SET username=?, full_name=?, last_seen=? WHERE user_id=?",
+                (uname, fname, now_iso, uid),
+            )
+            conn.commit()
+            row = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+            
         return dict(row)
 
 
@@ -196,8 +206,8 @@ def db_get_profile(uid):
 def db_save_profile(uid, name, age, city, diagnosis, about):
     with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO profiles(user_id,name,age,city,diagnosis,about,approved,rejected) "
-            "VALUES(?,?,?,?,?,?,0,0)",
+            "INSERT OR REPLACE INTO profiles(user_id,name,age,city,diagnosis,about,approved,rejected,inactive) "
+            "VALUES(?,?,?,?,?,?,0,0,0)",
             (uid, name, age, city, diagnosis, about),
         )
         conn.commit()
@@ -394,7 +404,8 @@ def kb_admin():
         [InlineKeyboardButton("🎁 Выдать анон", callback_data="admin:give_anon"),
          InlineKeyboardButton("🗑 Снять анон", callback_data="admin:take_anon")],
         [InlineKeyboardButton("💲 Цены", callback_data="admin:prices")],
-        [InlineKeyboardButton("📋 Список юзеров", callback_data="admin:users")],
+        [InlineKeyboardButton("📋 Список юзеров", callback_data="admin:users_page:0")],
+        [InlineKeyboardButton("🗑 Удалить анкету", callback_data="admin:delete_profile")],
         [InlineKeyboardButton("◀️ Назад", callback_data="menu:main")],
     ])
 
@@ -433,6 +444,32 @@ async def is_admin(bot, uid):
         return m.status in ("creator", "administrator")
     except Exception:
         return False
+
+
+async def check_inactivity(ctx: ContextTypes.DEFAULT_TYPE):
+    seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        rows = conn.execute("""
+            SELECT p.user_id FROM profiles p
+            JOIN users u ON p.user_id = u.user_id
+            WHERE p.approved=1 AND p.inactive=0 AND u.banned=0
+              AND (u.last_seen IS NULL OR u.last_seen < ?)
+        """, (seven_days_ago,)).fetchall()
+        
+        for row in rows:
+            uid = row[0]
+            conn.execute("UPDATE profiles SET inactive=1 WHERE user_id=?", (uid,))
+            conn.commit()
+            try:
+                await ctx.bot.send_message(
+                    uid,
+                    "🍁 <b>Вас давно не было!</b>\n\n"
+                    "Вы не заходили в бота 7 дней, поэтому ваша анкета больше не показывается другим пользователям.\n\n"
+                    "Зайдите в бота и нажмите /start, чтобы снова стать активным и получать лайки!",
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception:
+                pass
 
 
 def get_partner(uid):
@@ -547,6 +584,14 @@ async def cmd_start(update, ctx):
     if not u["phone"]:
         return await ask_phone(msg)
     p = db_get_profile(uid)
+    
+    if p and p["inactive"] == 1:
+        with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+            conn.execute("UPDATE profiles SET inactive=0 WHERE user_id=?", (uid,))
+            conn.commit()
+        await msg.reply_text("✅ Ваша анкета снова активна и показывается другим пользователям!")
+        p = db_get_profile(uid)
+        
     if not p or p["rejected"]:
         return await start_circle(msg, ctx, uid)
     if not p["approved"]:
@@ -880,6 +925,18 @@ async def handle_admin_input(update, ctx):
             db_set(uid, banned=0, ban_reason=None)
             await msg.reply_text(f"🔓 <code>{uid}</code> разбанен.", parse_mode=ParseMode.HTML)
             await safe_send(ctx.bot, uid, "✅ Вы разбанены.")
+        elif kind == "delete_profile":
+            uid = int(msg.text.strip())
+            with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+                conn.execute("DELETE FROM users WHERE user_id=?", (uid,))
+                conn.execute("DELETE FROM profiles WHERE user_id=?", (uid,))
+                conn.execute("DELETE FROM likes WHERE from_id=? OR to_id=?", (uid, uid))
+                conn.execute("DELETE FROM skips WHERE from_id=? OR to_id=?", (uid, uid))
+                conn.execute("DELETE FROM anon_pairs WHERE user_a=? OR user_b=?", (uid, uid))
+                conn.execute("DELETE FROM anon_queue WHERE user_id=?", (uid,))
+                conn.commit()
+            await msg.reply_text(f"🗑 Анкета и данные <code>{uid}</code> полностью удалены.", reply_markup=kb_admin())
+            await safe_send(ctx.bot, uid, "🗑 Ваша анкета и данные были удалены администратором.\nДля создания новой напишите /start.")
         elif kind == "give_vip_uid":
             uid = int(msg.text.strip())
             ctx.user_data.pop("admin_input", None)
@@ -1026,7 +1083,7 @@ async def show_profile(q, uid):
             conn.row_factory = sqlite3.Row
             r = conn.execute(
                 "SELECT p.* FROM profiles p "
-                "WHERE p.approved=1 AND p.user_id != ? "
+                "WHERE p.approved=1 AND p.inactive=0 AND p.user_id != ? "
                 "  AND p.user_id NOT IN (SELECT to_id FROM likes WHERE from_id=? AND substr(ts,1,10)=?) "
                 "  AND p.user_id NOT IN (SELECT to_id FROM skips WHERE from_id=? AND substr(ts,1,10)=?) "
                 "ORDER BY RANDOM() LIMIT 1",
@@ -1706,10 +1763,16 @@ async def cb_admin_count(update, ctx):
     with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
         total = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         active = conn.execute("SELECT COUNT(*) FROM users WHERE banned=0").fetchone()[0]
-        approved = conn.execute("SELECT COUNT(*) FROM profiles WHERE approved=1").fetchone()[0]
+        banned = conn.execute("SELECT COUNT(*) FROM users WHERE banned=1").fetchone()[0]
+        approved = conn.execute("SELECT COUNT(*) FROM profiles WHERE approved=1 AND inactive=0").fetchone()[0]
+        inactive = conn.execute("SELECT COUNT(*) FROM profiles WHERE approved=1 AND inactive=1").fetchone()[0]
     try:
         await q.message.edit_text(
-            f"👥 Всего: <b>{total}</b>\nАктивных: <b>{active}</b>\nАнкет одобрено: <b>{approved}</b>",
+            f"👥 Всего: <b>{total}</b>\n"
+            f"Активных: <b>{active}</b>\n"
+            f"Забанено: <b>{banned}</b>\n"
+            f"Анкет одобрено: <b>{approved}</b>\n"
+            f"Анкет неактивно (7+ дней): <b>{inactive}</b>",
             parse_mode=ParseMode.HTML, reply_markup=kb_back("admin:main"),
         )
     except Exception:
@@ -1736,6 +1799,18 @@ async def cb_admin_unban(update, ctx):
     ctx.user_data["admin_input"] = ("unban",)
     try:
         await q.message.edit_text("Введите ID для разбана:", reply_markup=kb_back("admin:main"))
+    except Exception:
+        pass
+
+
+async def cb_admin_delete_profile(update, ctx):
+    q = update.callback_query
+    await q.answer()
+    if q.from_user.id != ADMIN_ID:
+        return
+    ctx.user_data["admin_input"] = ("delete_profile",)
+    try:
+        await q.message.edit_text("Введите ID пользователя, чтобы ПОЛНОСТЬЮ удалить его анкету и данные:", reply_markup=kb_back("admin:main"))
     except Exception:
         pass
 
@@ -1835,18 +1910,26 @@ async def cb_admin_price_set(update, ctx):
         pass
 
 
-async def cb_admin_users(update, ctx):
+async def cb_admin_users_page(update, ctx):
     q = update.callback_query
     await q.answer()
     if q.from_user.id != ADMIN_ID:
         return
+        
+    page = int(q.data.split(":")[2])
+    limit = 10
+    offset = page * limit
+    
     with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        total = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT user_id, username, full_name, vip, banned "
-            "FROM users ORDER BY created_at DESC LIMIT 50"
+            "FROM users ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (limit, offset)
         ).fetchall()
-    lines = ["📋 <b>Последние 50 юзеров:</b>", ""]
+        
+    lines = [f"📋 <b>Юзеры (Стр. {page+1}):</b>", ""]
     for r in rows:
         st = "🚫" if r["banned"] else "✅"
         if r["username"]:
@@ -1854,12 +1937,23 @@ async def cb_admin_users(update, ctx):
         else:
             who = escape(str(r["full_name"])) if r["full_name"] else "без имени"
         lines.append(f"{st} <code>{r['user_id']}</code> · {who} · VIP{r['vip']}")
+        
+    max_page = (total - 1) // limit if total > 0 else 0
+    
+    kb = []
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"admin:users_page:{page-1}"))
+    nav_row.append(InlineKeyboardButton(f"{page+1}/{max_page+1}", callback_data="noop"))
+    if page < max_page:
+        nav_row.append(InlineKeyboardButton("Далее ➡️", callback_data=f"admin:users_page:{page+1}"))
+    
+    if nav_row:
+        kb.append(nav_row)
+    kb.append([InlineKeyboardButton("◀️ В админку", callback_data="admin:main")])
+    
     try:
-        await q.message.edit_text(
-            "\n".join(lines),
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb_back("admin:main"),
-        )
+        await q.message.edit_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
     except Exception:
         pass
 
@@ -1874,6 +1968,9 @@ async def error_handler(update, ctx):
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
+
+    if app.job_queue:
+        app.job_queue.run_repeating(check_inactivity, interval=3600, first=60)
 
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE, ban_mw), group=-500)
     app.add_handler(CallbackQueryHandler(ban_cb_mw), group=-500)
@@ -1923,6 +2020,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_admin_count, pattern=r"^admin:count$"))
     app.add_handler(CallbackQueryHandler(cb_admin_ban, pattern=r"^admin:ban$"))
     app.add_handler(CallbackQueryHandler(cb_admin_unban, pattern=r"^admin:unban$"))
+    app.add_handler(CallbackQueryHandler(cb_admin_delete_profile, pattern=r"^admin:delete_profile$"))
     app.add_handler(CallbackQueryHandler(cb_admin_give_vip, pattern=r"^admin:give_vip$"))
     app.add_handler(CallbackQueryHandler(cb_admin_vip_lvl, pattern=r"^admin:vip_lvl:"))
     app.add_handler(CallbackQueryHandler(cb_admin_take_vip, pattern=r"^admin:take_vip$"))
@@ -1930,7 +2028,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_admin_take_anon, pattern=r"^admin:take_anon$"))
     app.add_handler(CallbackQueryHandler(cb_admin_prices, pattern=r"^admin:prices$"))
     app.add_handler(CallbackQueryHandler(cb_admin_price_set, pattern=r"^admin:price_set:"))
-    app.add_handler(CallbackQueryHandler(cb_admin_users, pattern=r"^admin:users$"))
+    app.add_handler(CallbackQueryHandler(cb_admin_users_page, pattern=r"^admin:users_page:"))
 
     app.add_handler(CallbackQueryHandler(cb_noop, pattern=r"^noop$"))
 
