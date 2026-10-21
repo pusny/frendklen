@@ -87,7 +87,6 @@ CREATE TABLE IF NOT EXISTS reports(id INTEGER PRIMARY KEY AUTOINCREMENT, reporte
 async def db_init():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(SCHEMA)
-        # Автомиграция для тех, у кого уже есть старая база
         try: await db.execute("ALTER TABLE users ADD COLUMN verify_words TEXT")
         except Exception: pass
         try: await db.execute("ALTER TABLE users ADD COLUMN has_prev_addon INTEGER DEFAULT 0")
@@ -901,6 +900,10 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     await db_init()
+    
+    # Принудительно очищаем меню команд
+    await bot.delete_my_commands()
+    
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
