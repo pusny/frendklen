@@ -87,6 +87,7 @@ def _init_db():
         );
         CREATE TABLE IF NOT EXISTS prices (key TEXT PRIMARY KEY, val INTEGER);
         CREATE TABLE IF NOT EXISTS admin_msgs (msg_id INTEGER PRIMARY KEY, user_id INTEGER, mtype TEXT);
+        CREATE TABLE IF NOT EXISTS skips (id INTEGER PRIMARY KEY AUTOINCREMENT, from_id INTEGER, to_id INTEGER, ts TEXT);
         """)
 
         cols_u = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
@@ -118,6 +119,7 @@ def _init_db():
         try:
             conn.execute("CREATE TABLE IF NOT EXISTS likes (id INTEGER PRIMARY KEY AUTOINCREMENT, from_id INTEGER, to_id INTEGER, ts TEXT)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_likes_ft ON likes(from_id, to_id, ts)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_skips_ft ON skips(from_id, to_id, ts)")
         except Exception:
             pass
 
@@ -138,6 +140,8 @@ _init_db()
 def fmt_dt(iso_str):
     if not iso_str:
         return "—"
+    if str(iso_str).lower() == 'forever':
+        return "Навсегда"
     try:
         dt = datetime.fromisoformat(iso_str)
         if dt.tzinfo is None:
@@ -245,6 +249,8 @@ def ensure_daily_likes(uid):
 
 def add_days(base_iso, days):
     now = datetime.now(timezone.utc)
+    if base_iso and str(base_iso).lower() == 'forever':
+        return 'forever'
     if base_iso:
         try:
             base = datetime.fromisoformat(base_iso)
@@ -446,6 +452,10 @@ def anon_time_left(uid):
     if u["anon_free_date"] != today:
         db_set(uid, anon_free_date=today, anon_free_used=0)
         u = db_get_user(uid)
+        
+    if u["anon_until"] == 'forever':
+        return 99999999
+        
     if u["anon_until"]:
         try:
             until = datetime.fromisoformat(u["anon_until"])
@@ -879,7 +889,7 @@ async def handle_admin_input(update, ctx):
             new_likes = vip_like_limit(lvl)
             
             if days == 0:
-                db_set(uid, vip=lvl, vip_until=None, likes_left=new_likes, likes_date=today)
+                db_set(uid, vip=lvl, vip_until='forever', likes_left=new_likes, likes_date=today)
                 await safe_send(ctx.bot, uid, f"🎁 VIP {lvl} выдан навсегда!")
             else:
                 db_set(uid, vip=lvl, vip_until=add_days(u["vip_until"], days), likes_left=new_likes, likes_date=today)
@@ -898,8 +908,7 @@ async def handle_admin_input(update, ctx):
             uid = int(parts[0])
             days = int(parts[1]) if len(parts) > 1 else ANON_PAID_DAYS
             if days == 0:
-                until = (datetime.now(timezone.utc) + timedelta(days=36500)).isoformat()
-                db_set(uid, anon_until=until)
+                db_set(uid, anon_until='forever')
                 await safe_send(ctx.bot, uid, "🎁 Анон-доступ выдан навсегда!")
             else:
                 u = db_get_user(uid)
@@ -1006,34 +1015,19 @@ async def show_profile(q, uid):
             r = conn.execute(
                 "SELECT p.* FROM profiles p "
                 "WHERE p.approved=1 AND p.user_id != ? "
-                "  AND p.user_id NOT IN ("
-                "    SELECT to_id FROM likes WHERE from_id=? AND substr(ts,1,10)=?"
-                "  ) "
+                "  AND p.user_id NOT IN (SELECT to_id FROM likes WHERE from_id=? AND substr(ts,1,10)=?) "
+                "  AND p.user_id NOT IN (SELECT to_id FROM skips WHERE from_id=? AND substr(ts,1,10)=?) "
                 "ORDER BY RANDOM() LIMIT 1",
-                (uid, uid, today),
+                (uid, uid, today, uid, today),
             ).fetchone()
     except Exception:
         r = None
 
-    if r is None:
-        try:
-            with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
-                conn.row_factory = sqlite3.Row
-                r = conn.execute(
-                    "SELECT p.* FROM profiles p "
-                    "WHERE p.approved=1 AND p.user_id != ? "
-                    "ORDER BY RANDOM() LIMIT 1",
-                    (uid,),
-                ).fetchone()
-        except Exception:
-            r = None
-
     if not r:
         try:
             await q.message.edit_text(
-                "🍁 <b>Анкет для показа нет.</b>\n\n"
-                "Возможно, все анкеты закончились или вы уже всех лайкнули сегодня. "
-                "Заходите позже!",
+                "🍁 <b>Вы пролистали все анкеты!</b>\n\n"
+                "Возвращайтесь завтра, чтобы снова листать и ставить лайки.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb_back(),
             )
@@ -1109,7 +1103,6 @@ async def cb_like(update, ctx):
                 (uid, target, today),
             ).fetchone()
             if already:
-                await q.message.answer("Вы уже лайкнули этого пользователя сегодня")
                 await show_profile(q, uid)
                 return
             conn.execute(
@@ -1149,16 +1142,59 @@ async def cb_like(update, ctx):
         await safe_send(ctx.bot, uid, text_me)
         await safe_send(ctx.bot, target, text_other)
     else:
-        await safe_send(ctx.bot, target, "❤️ Кто-то лайкнул вашу анкету. Возможно, взаимно!")
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("👀 Посмотреть анкету", callback_data=f"view_liker:{uid}")]
+        ])
+        await safe_send(ctx.bot, target, "❤️ Кто-то лайкнул вашу анкету. Возможно, взаимно!", reply_markup=kb)
 
     await show_profile(q, uid)
+
+
+async def cb_view_liker(update, ctx):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    target = int(q.data.split(":")[1])
+    p = db_get_profile(target)
+    if not p:
+        return await q.message.edit_text("Анкета недоступна.", reply_markup=kb_back())
+    
+    text = (
+        f"<b>🍁 Вам поставили лайк!</b>\n\n"
+        f"Имя: {escape(str(p['name']))}\n"
+        f"Возраст: {escape(str(p['age']))}\n"
+        f"Город: {escape(str(p['city']))}\n"
+        f"Диагноз: {escape(str(p['diagnosis']))}\n"
+        f"О себе: {escape(str(p['about']))}"
+    )
+    rows = [
+        [InlineKeyboardButton("❤️ Взаимно", callback_data=f"like:{target}")],
+        [InlineKeyboardButton("🚨 Жалоба", callback_data=f"prof_report:{target}")],
+        [InlineKeyboardButton("◀️ В меню", callback_data="menu:main")]
+    ]
+    try:
+        await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+    except Exception:
+        pass
 
 
 async def cb_skip(update, ctx):
     q = update.callback_query
     await q.answer()
+    uid = q.from_user.id
+    target = int(q.data.split(":")[1])
+    today = datetime.now(MSK).date().isoformat()
     try:
-        await show_profile(q, q.from_user.id)
+        with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+            conn.execute(
+                "INSERT INTO skips(from_id,to_id,ts) VALUES(?,?,?)",
+                (uid, target, datetime.now(timezone.utc).isoformat())
+            )
+            conn.commit()
+    except Exception:
+        pass
+    try:
+        await show_profile(q, uid)
     except Exception as e:
         try:
             await q.message.answer(f"⚠️ <code>{escape(str(e))}</code>", parse_mode=ParseMode.HTML)
@@ -1177,6 +1213,11 @@ async def cb_back_profile(update, ctx):
     p = db_get_profile(target)
     if not p:
         return
+    
+    today = datetime.now(MSK).date().isoformat()
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        already = conn.execute("SELECT 1 FROM likes WHERE from_id=? AND to_id=? AND substr(ts,1,10)=?", (uid, target, today)).fetchone()
+    
     text = (
         f"<b>🍁 Анкета</b>\n\n"
         f"Имя: {escape(str(p['name']))}\n"
@@ -1185,11 +1226,17 @@ async def cb_back_profile(update, ctx):
         f"Диагноз: {escape(str(p['diagnosis']))}\n"
         f"О себе: {escape(str(p['about']))}"
     )
-    rows = [[
-        InlineKeyboardButton("❤️ Лайк", callback_data=f"like:{target}"),
+    
+    rows = []
+    if not already:
+        rows.append([InlineKeyboardButton("❤️ Лайк", callback_data=f"like:{target}")])
+    
+    rows.append([
         InlineKeyboardButton("➡️ Дальше", callback_data=f"skip:{target}"),
         InlineKeyboardButton("🚨", callback_data=f"prof_report:{target}"),
-    ], [InlineKeyboardButton("◀️ В меню", callback_data="menu:main")]]
+    ])
+    rows.append([InlineKeyboardButton("◀️ В меню", callback_data="menu:main")])
+
     try:
         await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
     except Exception:
@@ -1230,7 +1277,10 @@ async def cb_menu_profile(update, ctx):
     
     vip_str = vip_label(u['vip'])
     if u['vip'] > 0 and u['vip_until']:
-        vip_str += f" (до {fmt_dt(u['vip_until'])})"
+        if u['vip_until'] == 'forever':
+            vip_str += " (Навсегда)"
+        else:
+            vip_str += f" (до {fmt_dt(u['vip_until'])})"
         
     likes_str = "∞" if u['likes_left'] >= 10**9 else str(u['likes_left'])
     
@@ -1242,7 +1292,10 @@ async def cb_menu_profile(update, ctx):
         f"Лимит символов: {'∞' if vip_char_limit(u['vip']) >= 10**9 else vip_char_limit(u['vip'])}\n"
     )
     if u["anon_until"]:
-        text += f"Анон-доступ до: {fmt_dt(u['anon_until'])}\n"
+        if u["anon_until"] == 'forever':
+            text += "Анон-доступ: Навсегда\n"
+        else:
+            text += f"Анон-доступ до: {fmt_dt(u['anon_until'])}\n"
     if p:
         text += (
             f"\n<b>Анкета:</b>\n"
@@ -1391,7 +1444,14 @@ async def cb_menu_anon(update, ctx):
     await q.answer()
     uid = q.from_user.id
     left = anon_time_left(uid)
-    if left <= 0:
+    if left >= 99999999:
+        text = (
+            f"💬 <b>Анонимный чат</b>\n\n"
+            f"⏳ Осталось: <b>Навсегда</b>\n\n"
+            "🔎 Найти собеседника — подберём пару.\n"
+            "🛑 Стоп — завершить диалог."
+        )
+    elif left <= 0:
         price = db_get_price("anon")
         text = (
             f"⏰ <b>Бесплатный час израсходован.</b>\n\n"
@@ -1814,6 +1874,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_skip, pattern=r"^skip:"))
     app.add_handler(CallbackQueryHandler(cb_back_profile, pattern=r"^back:"))
     app.add_handler(CallbackQueryHandler(cb_prof_report, pattern=r"^prof_report:"))
+    app.add_handler(CallbackQueryHandler(cb_view_liker, pattern=r"^view_liker:"))
 
     app.add_handler(CallbackQueryHandler(cb_profile_edit, pattern=r"^profile:edit$"))
 
