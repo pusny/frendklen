@@ -29,7 +29,7 @@ from telegram.constants import ParseMode
 from telegram.error import NetworkError, TimedOut, RetryAfter, Forbidden, BadRequest
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters
+    ContextTypes, filters, ApplicationHandlerStop
 )
 
 load_dotenv()
@@ -74,6 +74,10 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("klenchik")
 
+# --- СОСТОЯНИЯ АНОНИМНОГО ЧАТА ---
+WAITING_USERS = set()
+ACTIVE_CHATS = {}
+
 
 def get_payment_contact() -> str:
     pl = (PAYMENT_LINK or "").strip()
@@ -94,6 +98,7 @@ CREATE TABLE IF NOT EXISTS users(
  tg_id INTEGER PRIMARY KEY, username TEXT, phone TEXT,
  status TEXT DEFAULT 'new', banned INTEGER DEFAULT 0, ban_reason TEXT,
  vip_level INTEGER DEFAULT 0, vip_until TEXT,
+ incognito_until TEXT,
  likes_left INTEGER DEFAULT 20, likes_reset_at TEXT,
  photos_used INTEGER DEFAULT 0, video_used INTEGER DEFAULT 0,
  chars_limit INTEGER DEFAULT 300, prev_anketa_id INTEGER,
@@ -136,11 +141,14 @@ def now_iso():
 async def db_init():
     conn = sqlite3.connect(DB_PATH)
     conn.executescript(SCHEMA)
+    # Автомиграции
     try: conn.execute("ALTER TABLE users ADD COLUMN verify_words TEXT")
     except: pass
     try: conn.execute("ALTER TABLE users ADD COLUMN has_prev_addon INTEGER DEFAULT 0")
     except: pass
     try: conn.execute("ALTER TABLE users ADD COLUMN pending_action TEXT")
+    except: pass
+    try: conn.execute("ALTER TABLE users ADD COLUMN incognito_until TEXT")
     except: pass
     conn.commit()
     conn.close()
@@ -209,6 +217,17 @@ def main_menu_kb():
         [InlineKeyboardButton("👤 Моя анкета", callback_data="menu:profile")],
     ])
 
+def incognito_menu_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔍 Искать собеседника", callback_data="incog:search")],
+        [InlineKeyboardButton("⬅️ В меню", callback_data="menu:back")]
+    ])
+
+def incog_active_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛑 Остановить чат", callback_data="incog:stop")]
+    ])
+
 async def send_main_menu(bot, chat_id):
     await safe(bot.send_message, chat_id=chat_id, text="🏠 <b>Главное меню</b>\nВыберите раздел:", reply_markup=main_menu_kb(), parse_mode=ParseMode.HTML)
 
@@ -227,6 +246,14 @@ def admin_main_kb():
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user: return
+
+    # Если в анонимном чате - выкидываем
+    if user.id in ACTIVE_CHATS:
+        partner = ACTIVE_CHATS.pop(user.id, None)
+        if partner:
+            ACTIVE_CHATS.pop(partner, None)
+            await safe(ctx.bot.send_message, partner, "🛑 Собеседник покинул чат. Вы можете найти нового.", reply_markup=incognito_menu_kb())
+        WAITING_USERS.discard(user.id)
 
     await db_exec("DELETE FROM admin_states WHERE tg_id=?", (user.id,))
     await db_exec("UPDATE users SET pending_action=NULL WHERE tg_id=?", (user.id,))
@@ -280,6 +307,23 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML, reply_markup=ReplyKeyboardRemove()
         )
 
+async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    if user_id in WAITING_USERS:
+        WAITING_USERS.remove(user_id)
+        return await update.message.reply_text("🛑 Поиск собеседника отменен.", reply_markup=incognito_menu_kb())
+        
+    if user_id in ACTIVE_CHATS:
+        partner_id = ACTIVE_CHATS.pop(user_id)
+        ACTIVE_CHATS.pop(partner_id, None)
+        
+        await update.message.reply_text("🛑 Вы покинули анонимный чат.", reply_markup=incognito_menu_kb())
+        await safe(ctx.bot.send_message, partner_id, "🛑 Собеседник покинул чат. Вы можете найти нового.", reply_markup=incognito_menu_kb())
+        return
+
+    await update.message.reply_text("Вы сейчас не в чате и не в поиске.")
+
 async def cmd_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or user.id != SUPERADMIN_ID: return
@@ -322,15 +366,23 @@ async def on_contact(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or not msg.video_note: return
-    u = await get_user(msg.from_user.id)
+    user_id = msg.from_user.id
+    
+    # Проверка на анонимный чат
+    if user_id in ACTIVE_CHATS:
+        partner = ACTIVE_CHATS[user_id]
+        await safe(ctx.bot.copy_message, chat_id=partner, from_chat_id=user_id, message_id=msg.message_id)
+        return
+
+    u = await get_user(user_id)
     if not u or u["status"] != "awaiting_video": return
 
-    await upsert_user(msg.from_user.id, status="awaiting_form")
+    await upsert_user(user_id, status="awaiting_form")
 
     await safe(
         db_exec,
         "INSERT OR IGNORE INTO profiles(tg_id, video, approved, created_at) VALUES(?,?,0,?)",
-        (msg.from_user.id, msg.video_note.file_id, now_iso())
+        (user_id, msg.video_note.file_id, now_iso())
     )
 
     lim = await vip_limits(u)
@@ -380,6 +432,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = msg.from_user.id
     text = msg.text
 
+    # 1. Проверка Анонимного чата
+    if user_id in ACTIVE_CHATS:
+        partner = ACTIVE_CHATS[user_id]
+        await safe(ctx.bot.copy_message, chat_id=partner, from_chat_id=user_id, message_id=msg.message_id)
+        return
+
+    # 2. Проверка админки
     admin_state = await db_exec("SELECT * FROM admin_states WHERE tg_id=?", (user_id,), fetch="one")
     if admin_state:
         await handle_admin_input(msg, ctx, admin_state)
@@ -434,8 +493,20 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await send_to_admin_chat(ctx.bot, prof, u)
         return
 
-async def on_photo_with_caption(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await on_text(update, ctx)
+async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg: return
+    user_id = msg.from_user.id
+    
+    # Проверка Анонимного чата (фото, стикеры и т.д.)
+    if user_id in ACTIVE_CHATS:
+        partner = ACTIVE_CHATS[user_id]
+        await safe(ctx.bot.copy_message, chat_id=partner, from_chat_id=user_id, message_id=msg.message_id)
+        return
+        
+    # Фото-анкета
+    if msg.photo and msg.caption:
+        await on_text(update, ctx)
 
 async def send_to_admin_chat(bot, prof, u):
     text = (
@@ -544,7 +615,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "Отправь строку в формате:\n"
                 "<code><tg_id> тип значение1 значение2</code>\n\n"
                 "<b>Примеры:</b>\n"
-                "<code>123456789 вип средний 30</code> — VIP Средний на 30 дней (можно писать <code>1</code>, <code>2</code>, <code>3</code>)\n"
+                "<code>123456789 вип средний 30</code> — VIP Средний на 30 дней\n"
                 "<code>123456789 доп символы 0</code> — символы до 600\n"
                 "<code>123456789 доп лайки 0</code> — безлимит лайков\n"
                 "<code>123456789 доп возврат 0</code> — возврат анкеты\n"
@@ -565,6 +636,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "<code>123456789 лайки</code> — снять безлимит\n"
                 "<code>123456789 возврат</code> — снять возврат анкеты\n"
                 "<code>123456789 фото</code> — снять второе фото\n"
+                "<code>123456789 инкогнито</code> — снять инкогнито\n"
                 "<code>123456789 все</code> — снять все допы",
                 parse_mode=ParseMode.HTML
             )
@@ -600,7 +672,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await db_exec("INSERT OR REPLACE INTO admin_states(tg_id, action, target_id) VALUES(?,?,?)", (user_id, "takedop", tid))
             await query.message.reply_text(
                 "Что снять? Отправь одно слово:\n"
-                "символы / лайки / возврат / фото / все"
+                "символы / лайки / возврат / фото / инкогнито / все"
             )
 
         elif act == "delprof":
@@ -636,6 +708,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not u: return
 
     if data == "menu:back":
+        WAITING_USERS.discard(user_id)
         await query.message.edit_text("🏠 <b>Главное меню</b>", reply_markup=main_menu_kb(), parse_mode=ParseMode.HTML)
 
     elif data == "menu:ankety":
@@ -680,8 +753,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         mutual = await db_exec("SELECT 1 FROM likes WHERE from_tg=? AND to_tg=?", (target, user_id), fetch="one")
         if mutual:
-            await safe(ctx.bot.send_message, target, "💞 Взаимный лайк! Зайдите в чат инкогнито.")
-            await query.message.reply_text("💞 Взаимно!")
+            await safe(ctx.bot.send_message, target, "💞 Взаимный лайк!")
+            await query.message.reply_text("💞 Взаимно! Человек получил уведомление.")
         await query.answer("❤️ Лайк отправлен")
         await show_next_profile(query, u, 0)
 
@@ -701,7 +774,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "unlimited_likes": "Безлимит лайков на день.",
             "prev_anketa": "Возврат предыдущей анкеты.",
             "second_media": "Второе фото/видео.",
-            "incognito_day": "Доступ в чат инкогнито на день."
+            "incognito_day": "Доступ к анонимному чату на 1 день."
         }
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("💳 Купить", callback_data=f"buy:{key}")], [InlineKeyboardButton("⬅️ Назад", callback_data="menu:shop")]])
         await query.message.edit_text(f"<b>{name}</b> — {price}₽\n\n{desc.get(key, '')}", reply_markup=kb, parse_mode=ParseMode.HTML)
@@ -729,12 +802,71 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "menu:incognito":
-        if u["vip_level"] == 0: return await query.answer("Доступ по VIP или купите доп.", show_alert=True)
-        await query.message.reply_text("💬 Отправьте сообщение — оно уйдёт анонимно.")
+        # Проверяем доступ
+        until = u["incognito_until"]
+        has_access = until and datetime.fromisoformat(until) > datetime.utcnow()
+        
+        if not has_access:
+            return await query.answer("У вас нет доступа. Купите в магазине за 30р/день.", show_alert=True)
+            
+        if user_id in ACTIVE_CHATS:
+            return await query.answer("Вы уже в чате. Напишите /stop чтобы выйти.", show_alert=True)
+            
+        await query.message.edit_text(
+            "💬 <b>Анонимный чат</b>\n\n"
+            "Здесь вы можете анонимно пообщаться со случайным человеком.\n"
+            "Нажмите «Искать собеседника», чтобы начать.",
+            reply_markup=incognito_menu_kb(),
+            parse_mode=ParseMode.HTML
+        )
+
+    elif data == "incog:search":
+        # Проверяем доступ
+        until = u["incognito_until"]
+        has_access = until and datetime.fromisoformat(until) > datetime.utcnow()
+        if not has_access:
+            return await query.answer("Доступ истек.", show_alert=True)
+
+        if user_id in ACTIVE_CHATS:
+            return await query.answer("Вы уже в чате. Напишите /stop.", show_alert=True)
+            
+        if user_id in WAITING_USERS:
+            return await query.answer("Вы уже в поиске. Нажмите /stop.", show_alert=True)
+
+        # Пытаемся найти пару
+        if WAITING_USERS:
+            partner_id = WAITING_USERS.pop()
+            ACTIVE_CHATS[user_id] = partner_id
+            ACTIVE_CHATS[partner_id] = user_id
+
+            await safe(query.bot.send_message, user_id, "✅ <b>Собеседник найден!</b>\n\nВы общаетесь анонимно. Отправьте сообщение.\nЧтобы выйти, нажмите /stop.", reply_markup=incog_active_kb(), parse_mode=ParseMode.HTML)
+            await safe(query.bot.send_message, partner_id, "✅ <b>Собеседник найден!</b>\n\nВы общаетесь анонимно. Отправьте сообщение.\nЧтобы выйти, нажмите /stop.", reply_markup=incog_active_kb(), parse_mode=ParseMode.HTML)
+            await query.message.delete()
+        else:
+            WAITING_USERS.add(user_id)
+            await query.message.edit_text(
+                "🔍 <b>Ищем собеседника...</b>\n\n"
+                "Пожалуйста, подождите. Как только кто-то зайдет, вы сразу начнете общение.\n"
+                "Чтобы отменить поиск, нажмите /stop.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Отменить поиск", callback_data="incog:stop")]]),
+                parse_mode=ParseMode.HTML
+            )
+
+    elif data == "incog:stop":
+        WAITING_USERS.discard(user_id)
+        
+        if user_id in ACTIVE_CHATS:
+            partner_id = ACTIVE_CHATS.pop(user_id)
+            ACTIVE_CHATS.pop(partner_id, None)
+            
+            await query.message.edit_text("🛑 Вы покинули чат.", reply_markup=incognito_menu_kb())
+            await safe(query.bot.send_message, partner_id, "🛑 Собеседник покинул чат. Вы можете найти нового.", reply_markup=incognito_menu_kb())
+        else:
+            await query.message.edit_text("🛑 Поиск отменен.", reply_markup=incognito_menu_kb())
 
     elif data == "menu:support":
         await db_exec("UPDATE users SET pending_action='support' WHERE tg_id=?", (user_id,))
-        await query.message.reply_text(
+        await query.message.edit_text(
             "🆘 <b>Поддержка</b>\n\n"
             "Напишите ваш вопрос одним сообщением, и администрация ответит вам прямо здесь.",
             parse_mode=ParseMode.HTML
@@ -755,7 +887,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"❤️ <b>Лайков:</b> {u['likes_left']}\n"
             f"⚙️ <b>Статус:</b> {u['status']}"
         )
-        await query.message.reply_text(text, parse_mode=ParseMode.HTML)
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Меню", callback_data="menu:back")]]), parse_mode=ParseMode.HTML)
 
 async def show_next_profile(query, u, offset):
     async with sqlite3.connect(DB_PATH) as conn:
@@ -771,7 +903,7 @@ async def show_next_profile(query, u, offset):
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В меню", callback_data="menu:back")]])
         if u["prev_anketa_id"] and has_prev:
             kb.inline_keyboard.insert(0, [InlineKeyboardButton("⏪ Вернуть пропущенную", callback_data=f"prev:{u['prev_anketa_id']}")])
-        return await query.message.reply_text("Больше анкет нет.", reply_markup=kb)
+        return await query.message.edit_text("Больше анкет нет.", reply_markup=kb)
 
     text = f"👤 <b>{prof['name']}</b>, {prof['age']} ({prof['pronouns']})\n📍 {prof['city']}\n\n🩺 {prof['diagnosis']}\n💭 {prof['reason']}\n🎨 {prof['hobby']}"
 
@@ -789,6 +921,10 @@ async def show_next_profile(query, u, offset):
         await query.message.reply_photo(prof["photo1"], caption=text, reply_markup=kb, parse_mode=ParseMode.HTML)
     else:
         await query.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    try:
+        await query.message.delete()
+    except:
+        pass
 
 def translate_dop(dop: str) -> str:
     dop = dop.lower().strip()
@@ -814,7 +950,7 @@ async def _grant_dop(tid: int, dop: str, days: int):
         await upsert_user(tid, photos_used=0)
     elif dop == "incognito":
         until = (datetime.utcnow() + timedelta(days=max(days, 1))).isoformat()
-        await upsert_user(tid, vip_until=until, vip_level=max(1, 1))
+        await upsert_user(tid, incognito_until=until)
 
 async def _take_dop(tid: int, dop: str):
     dop = translate_dop(dop)
@@ -826,8 +962,10 @@ async def _take_dop(tid: int, dop: str):
         await upsert_user(tid, has_prev_addon=0, prev_anketa_id=None)
     elif dop == "second":
         await upsert_user(tid, photos_used=0)
+    elif dop == "incognito":
+        await upsert_user(tid, incognito_until=None)
     elif dop == "all":
-        await upsert_user(tid, chars_limit=300, likes_left=20, has_prev_addon=0, prev_anketa_id=None)
+        await upsert_user(tid, chars_limit=300, likes_left=20, has_prev_addon=0, prev_anketa_id=None, incognito_until=None)
 
 async def handle_admin_input(msg, ctx, state_row):
     action = state_row["action"]
@@ -946,13 +1084,15 @@ def main():
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("reply", cmd_reply))
 
     app.add_handler(MessageHandler(filters.CONTACT, on_contact))
     app.add_handler(MessageHandler(filters.VIDEO_NOTE, on_video))
-    app.add_handler(MessageHandler(filters.PHOTO & filters.Caption(), on_photo_with_caption))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(~filters.COMMAND & ~filters.CONTACT & ~filters.VIDEO_NOTE, on_media)) # стикеры, фото и т.д.
+    
     app.add_handler(CallbackQueryHandler(on_callback))
 
     log.info("Бот Кленчик запущен на PTB.")
