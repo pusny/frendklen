@@ -38,6 +38,8 @@ DATA_DIR = Path((os.getenv("DATA_DIR") or ".").strip()) / "app" / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = str(DATA_DIR / "klencik.db")
 
+MSK = timezone(timedelta(hours=3))
+
 CODE_WORDS = ["клён", "листопад", "янтарь", "осень", "ветер", "огонь", "река",
               "туман", "рассвет", "пепел", "север", "ирис", "кобальт", "стрела", "гром"]
 
@@ -133,6 +135,19 @@ def _init_db():
 _init_db()
 
 
+def fmt_dt(iso_str):
+    if not iso_str:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(MSK)
+        return dt.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return iso_str.replace("T", " ")[:16]
+
+
 def db_get_user(uid, tg_user=None):
     with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
         conn.row_factory = sqlite3.Row
@@ -223,7 +238,7 @@ def vip_label(v):
 
 def ensure_daily_likes(uid):
     u = db_get_user(uid)
-    today = datetime.now(timezone.utc).date().isoformat()
+    today = datetime.now(MSK).date().isoformat()
     if u["likes_date"] != today:
         db_set(uid, likes_left=vip_like_limit(u["vip"]), likes_date=today)
 
@@ -427,7 +442,7 @@ def get_partner(uid):
 
 def anon_time_left(uid):
     u = db_get_user(uid)
-    today = datetime.now(timezone.utc).date().isoformat()
+    today = datetime.now(MSK).date().isoformat()
     if u["anon_free_date"] != today:
         db_set(uid, anon_free_date=today, anon_free_used=0)
         u = db_get_user(uid)
@@ -859,18 +874,22 @@ async def handle_admin_input(update, ctx):
         elif kind == "give_vip_days":
             uid, lvl = args
             days = int(msg.text.strip())
+            u = db_get_user(uid)
+            today = datetime.now(MSK).date().isoformat()
+            new_likes = vip_like_limit(lvl)
+            
             if days == 0:
-                db_set(uid, vip=lvl, vip_until=None)
+                db_set(uid, vip=lvl, vip_until=None, likes_left=new_likes, likes_date=today)
                 await safe_send(ctx.bot, uid, f"🎁 VIP {lvl} выдан навсегда!")
             else:
-                u = db_get_user(uid)
-                db_set(uid, vip=lvl, vip_until=add_days(u["vip_until"], days))
+                db_set(uid, vip=lvl, vip_until=add_days(u["vip_until"], days), likes_left=new_likes, likes_date=today)
                 await safe_send(ctx.bot, uid, f"🎁 VIP {lvl} выдан на {days} дн.!")
             await msg.reply_text(f"✅ VIP {lvl} → <code>{uid}</code>", parse_mode=ParseMode.HTML,
                                  reply_markup=kb_admin())
         elif kind == "take_vip":
             uid = int(msg.text.strip())
-            db_set(uid, vip=0, vip_until=None)
+            today = datetime.now(MSK).date().isoformat()
+            db_set(uid, vip=0, vip_until=None, likes_left=vip_like_limit(0), likes_date=today)
             await safe_send(ctx.bot, uid, "⚠️ VIP снят администратором.")
             await msg.reply_text(f"🗑 VIP снят с <code>{uid}</code>.", parse_mode=ParseMode.HTML,
                                  reply_markup=kb_admin())
@@ -979,7 +998,7 @@ async def cb_menu_profiles(update, ctx):
 
 
 async def show_profile(q, uid):
-    today = datetime.now(timezone.utc).date().isoformat()
+    today = datetime.now(MSK).date().isoformat()
     r = None
     try:
         with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
@@ -1082,7 +1101,7 @@ async def cb_like(update, ctx):
             pass
         return
 
-    today = datetime.now(timezone.utc).date().isoformat()
+    today = datetime.now(MSK).date().isoformat()
     try:
         with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
             already = conn.execute(
@@ -1208,15 +1227,22 @@ async def cb_menu_profile(update, ctx):
     uid = q.from_user.id
     u = db_get_user(uid, q.from_user)
     p = db_get_profile(uid)
+    
+    vip_str = vip_label(u['vip'])
+    if u['vip'] > 0 and u['vip_until']:
+        vip_str += f" (до {fmt_dt(u['vip_until'])})"
+        
+    likes_str = "∞" if u['likes_left'] >= 10**9 else str(u['likes_left'])
+    
     text = (
         f"👤 <b>Ваш профиль</b>\n\n"
         f"ID: <code>{uid}</code>\n"
-        f"VIP: {vip_label(u['vip'])}\n"
-        f"Лайков сегодня: {u['likes_left']}\n"
+        f"VIP: {vip_str}\n"
+        f"Лайков сегодня: {likes_str}\n"
         f"Лимит символов: {'∞' if vip_char_limit(u['vip']) >= 10**9 else vip_char_limit(u['vip'])}\n"
     )
     if u["anon_until"]:
-        text += f"Анон-доступ до: {escape(u['anon_until'][:16])}\n"
+        text += f"Анон-доступ до: {fmt_dt(u['anon_until'])}\n"
     if p:
         text += (
             f"\n<b>Анкета:</b>\n"
