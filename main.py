@@ -2,6 +2,7 @@ import asyncio
 import os
 import random
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -157,8 +158,7 @@ async def cmd_start(m: Message, state: FSMContext):
         return await m.answer(
             "🌸 Добро пожаловать в <b>Кленовый букетик</b>!\n\n"
             "Для регистрации поделитесь номером телефона — кнопка ниже.\n"
-            "🔒 Номер остаётся внутри чата с ботом, никуда не передаётся, "
-            "используется только для защиты от мультиаккаунтов и подтверждения возраста.",
+            "🔒 Номер остаётся внутри чата с ботом, никуда не передаётся.",
             reply_markup=kb, parse_mode="HTML")
     if u["status"] == "awaiting_video":
         await state.set_state(S.video)
@@ -230,7 +230,7 @@ async def ask_form(m: Message, u: dict, video_note_file_id: Optional[str] = None
         f"{FORM_TEMPLATE}\n\n"
         f"Лимит символов: <b>{chars}</b>.\n"
         "По желанию прикрепите 1 фото в этом же сообщении.\n"
-        "Возраст от 18 лет.",
+        "Возраст от 12 лет.",
         parse_mode="HTML")
 
 def parse_form(text: str):
@@ -239,38 +239,53 @@ def parse_form(text: str):
         return None
     out = {}
     keys = ["name", "age", "pronouns", "city", "diagnosis", "reason", "hobby"]
+    field_names = ["Имя/Псевдоним", "Возраст", "Местоимения", "Город", "Диагноз", "Зачем пришёл/ла", "Хобби"]
+    
     for i, key in enumerate(keys):
         line = lines[i]
         if not line.startswith(f"{i+1}."):
             return None
-        val = line.split(".", 1)[1].strip().lstrip(":").strip()
+        val = line.split(".", 1)[1].strip()
+        
+        if val.startswith(field_names[i]):
+            val = val[len(field_names[i]):].strip()
+        
+        val = val.lstrip(":").strip()
         if not val:
             return None
         out[key] = val
+        
     try:
-        age = int(out["age"])
+        age_str = re.sub(r'\D', '', out["age"])
+        age = int(age_str)
     except Exception:
         return None
-    if not (18 <= age <= 99):
+    if not (12 <= age <= 99):
         return None
     return out
 
 @router.message(S.form)
 async def on_form(m: Message, state: FSMContext):
     u = await get_user(m.from_user.id)
-    if not m.text:
+    text = m.text or m.caption
+    
+    if not text:
         return await m.answer("Пришлите анкету текстом по шаблону.")
-    data = parse_form(m.text)
+        
+    data = parse_form(text)
     if not data:
         return await m.answer("❌ Анкета заполнена не по форме. Заполните точно по шаблону.\n\n" + FORM_TEMPLATE, parse_mode="HTML")
+        
     lim = await vip_limits(u)
     chars_limit = max(u.get("chars_limit") or 300, lim["chars"])
     for k in ["reason", "hobby", "diagnosis"]:
         if len(data[k]) > chars_limit:
             return await m.answer(f"❌ Поле «{k}» превышает лимит {chars_limit} символов.")
+            
     photo1 = None
     if m.photo:
         photo1 = m.photo[-1].file_id
+        
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE profiles SET name=?, age=?, pronouns=?, city=?, diagnosis=?, reason=?, hobby=?, photo1=COALESCE(?,photo1), approved=0 WHERE tg_id=?",
@@ -280,6 +295,7 @@ async def on_form(m: Message, state: FSMContext):
         db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM profiles WHERE tg_id=?", (m.from_user.id,))
         prof = dict(await cur.fetchone())
+        
     await upsert_user(m.from_user.id, status="pending_review")
     await state.clear()
     await m.answer("📨 Анкета отправлена на проверку. Ожидайте решения модератора.")
