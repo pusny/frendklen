@@ -845,15 +845,19 @@ async def admin_chat_handler(update, ctx):
                 conn.commit()
             phrase = " · ".join(random.sample(CODE_WORDS, 3))
             db_set(uid, circle_phrase=phrase)
+            
+            admin_name = f"@{msg.from_user.username}" if msg.from_user.username else msg.from_user.full_name
+            new_text = msg.reply_to_message.text + f"\n\n✏️ <b>Отправил на перепись:</b> {escape(admin_name)} (<code>{msg.from_user.id}</code>)"
+            try:
+                await msg.reply_to_message.edit_text(new_text, parse_mode=ParseMode.HTML, reply_markup=None)
+            except Exception:
+                pass
+                
             await safe_send(
                 ctx.bot, uid,
                 "✏️ Администратор попросил переписать анкету.\n\n"
                 "🎥 Запишите видео-кружок с фразой:\n\n"
                 f"<code>{phrase}</code>",
-            )
-            await msg.reply_text(
-                f"✏️ Запрос на перепись отправлен пользователю <code>{uid}</code>.",
-                parse_mode=ParseMode.HTML,
             )
             raise ApplicationHandlerStop
 
@@ -1579,10 +1583,15 @@ async def cb_app_accept(update, ctx):
     with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
         conn.execute("UPDATE profiles SET approved=1, rejected=0 WHERE user_id=?", (uid,))
         conn.commit()
+        
+    admin_name = f"@{q.from_user.username}" if q.from_user.username else q.from_user.full_name
+    new_text = q.message.text + f"\n\n✅ <b>Принял:</b> {escape(admin_name)} (<code>{q.from_user.id}</code>)"
+    
     try:
-        await q.message.edit_reply_markup(reply_markup=None)
+        await q.message.edit_text(new_text, parse_mode=ParseMode.HTML, reply_markup=None)
     except Exception:
         pass
+    
     await safe_send(ctx.bot, uid, "✅ Ваша анкета одобрена! Теперь вам доступны все функции.")
     await safe_send(
         ctx.bot, uid,
@@ -1601,10 +1610,15 @@ async def cb_app_reject(update, ctx):
         conn.execute("UPDATE profiles SET approved=0, rejected=1 WHERE user_id=?", (uid,))
         conn.execute("UPDATE users SET banned=1, ban_reason='Анкета отклонена' WHERE user_id=?", (uid,))
         conn.commit()
+        
+    admin_name = f"@{q.from_user.username}" if q.from_user.username else q.from_user.full_name
+    new_text = q.message.text + f"\n\n❌ <b>Отклонил:</b> {escape(admin_name)} (<code>{q.from_user.id}</code>)"
+    
     try:
-        await q.message.edit_reply_markup(reply_markup=None)
+        await q.message.edit_text(new_text, parse_mode=ParseMode.HTML, reply_markup=None)
     except Exception:
         pass
+        
     await notify_user(ctx.bot, uid, PROFILE_REJECTED)
     await q.answer("Отклонено")
 
@@ -1620,10 +1634,15 @@ async def cb_app_rewrite(update, ctx):
         conn.commit()
     phrase = " · ".join(random.sample(CODE_WORDS, 3))
     db_set(uid, circle_phrase=phrase)
+    
+    admin_name = f"@{q.from_user.username}" if q.from_user.username else q.from_user.full_name
+    new_text = q.message.text + f"\n\n✏️ <b>Отправил на перепись:</b> {escape(admin_name)} (<code>{q.from_user.id}</code>)"
+    
     try:
-        await q.message.edit_reply_markup(reply_markup=None)
+        await q.message.edit_text(new_text, parse_mode=ParseMode.HTML, reply_markup=None)
     except Exception:
         pass
+        
     await safe_send(
         ctx.bot, uid,
         "✏️ Администратор попросил переписать анкету.\n\n"
