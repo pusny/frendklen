@@ -9,6 +9,7 @@ from typing import Optional
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ContentType
+from aiogram.exceptions import TelegramMigrateToChat
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -37,14 +38,14 @@ if DATA_DIR and not os.path.isabs(DB_PATH):
 os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
 
 PRICES = {
-    "vip_low": (300, "VIP Низкий, 1 месяц"),
-    "vip_mid": (500, "VIP Средний, 1 месяц"),
-    "vip_high": (700, "VIP Высокий, 1 месяц"),
-    "chars_600": (40, "Символы до 600"),
-    "unlimited_likes": (200, "Снятие лимита лайков (1 день)"),
-    "prev_anketa": (80, "Возврат предыдущей анкеты"),
-    "second_media": (60, "Второе фото/видео"),
-    "incognito_day": (30, "Чат инкогнито (1 день)"),
+    "vip_low": (300, "🟢 VIP Низкий"),
+    "vip_mid": (500, "🟡 VIP Средний"),
+    "vip_high": (700, "🔴 VIP Высокий"),
+    "chars_600": (40, "📝 Символы до 600"),
+    "unlimited_likes": (200, "❤️ Безлимит лайков (1 день)"),
+    "prev_anketa": (80, "⏪ Возврат анкеты"),
+    "second_media": (60, "📸 Второе фото/видео"),
+    "incognito_day": (30, "🕵️ Чат инкогнито (1 день)"),
 }
 
 VIP_LIMITS = {
@@ -68,7 +69,7 @@ CREATE TABLE IF NOT EXISTS users(
  likes_left INTEGER DEFAULT 20, likes_reset_at TEXT,
  photos_used INTEGER DEFAULT 0, video_used INTEGER DEFAULT 0,
  chars_limit INTEGER DEFAULT 300, prev_anketa_id INTEGER,
- attempts_left INTEGER DEFAULT 3, created_at TEXT
+ attempts_left INTEGER DEFAULT 3, verify_words TEXT, created_at TEXT
 );
 CREATE TABLE IF NOT EXISTS profiles(
  id INTEGER PRIMARY KEY AUTOINCREMENT, tg_id INTEGER UNIQUE,
@@ -161,9 +162,9 @@ async def cmd_start(m: Message, state: FSMContext):
             keyboard=[[KeyboardButton(text="📱 Поделиться номером", request_contact=True)]],
             resize_keyboard=True, one_time_keyboard=True)
         return await m.answer(
-            "🌸 Добро пожаловать в <b>Кленовый букетик</b>!\n\n"
-            "Для регистрации поделитесь номером телефона — кнопка ниже.\n"
-            "🔒 Номер остаётся внутри чата с ботом, никуда не передаётся.",
+            "🌸 Добро пожаловать в <b>Кленчик</b>!\n\n"
+            "Для регистрации нам нужно убедиться, что вы реальный человек. Пожалуйста, поделитесь своим номером телефона, нажав на кнопку ниже.\n\n"
+            "🔒 <i>Ваш номер останется внутри бота, мы не передаём его третьим лицам. Он нужен только для защиты от мультиаккаунтов.</i>",
             reply_markup=kb, parse_mode="HTML")
     if u["status"] == "awaiting_video":
         await state.set_state(S.video)
@@ -172,12 +173,39 @@ async def cmd_start(m: Message, state: FSMContext):
         await state.set_state(S.form)
         return await ask_form(m, u)
     if u["status"] == "pending_review":
-        return await m.answer("⏳ Ваша анкета на модерации. Ожидайте.")
+        return await m.answer("⏳ Ваша анкета находится на проверке у модератора. Пожалуйста, ожидайте. Мы напишем вам, как только примем решение.")
+
+@router.message(Command("admin"))
+async def admin(m: Message, state: FSMContext):
+    if m.from_user.id != SUPERADMIN_ID:
+        return
+    await state.clear()
+    await m.answer("🛠 <b>Админ-панель</b>\nВыберите нужный раздел:", reply_markup=admin_kb(), parse_mode="HTML")
+
+@router.message(Command("reply"))
+async def reply_ticket(m: Message):
+    if m.from_user.id != SUPERADMIN_ID:
+        return
+    parts = m.text.split(" ", 2)
+    if len(parts) < 3:
+        return await m.answer("Формат: /reply <ticket_id> <текст>")
+    tid, txt = int(parts[1]), parts[2]
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT tg_id FROM tickets WHERE id=?", (tid,))
+        t = await cur.fetchone()
+        if not t:
+            return await m.answer("Тикет не найден.")
+        await db.execute("INSERT INTO ticket_msgs(ticket_id, from_admin, text, created_at) VALUES(?,?,?,?)",
+                         (tid, 1, txt, now()))
+        await db.commit()
+    await m.bot.send_message(t["tg_id"], f"🆘 Ответ поддержки по тикету #{tid}:\n\n{txt}")
+    await m.answer("Ответ отправлен.")
 
 @router.message(S.contact)
 async def on_contact(m: Message, state: FSMContext):
     if not m.contact or m.contact.user_id != m.from_user.id:
-        return await m.answer("Пожалуйста, воспользуйтесь кнопкой ниже.", reply_markup=ReplyKeyboardMarkup(
+        return await m.answer("Пожалуйста, воспользуйтесь кнопкой ниже, чтобы поделиться контактом.", reply_markup=ReplyKeyboardMarkup(
             keyboard=[[KeyboardButton(text="📱 Поделиться номером", request_contact=True)]],
             resize_keyboard=True, one_time_keyboard=True))
     await upsert_user(m.from_user.id, phone=m.contact.phone_number, status="awaiting_video", attempts_left=3)
@@ -186,12 +214,15 @@ async def on_contact(m: Message, state: FSMContext):
 
 async def ask_video(m: Message):
     words = random.sample(VERIFY_WORDS, 3)
+    words_str = ", ".join(words)
+    await upsert_user(m.from_user.id, verify_words=words_str)
+    
     await m.answer(
         "✅ Номер принят.\n\n"
-        f"📹 Теперь пришлите <b>видео-кружок</b> (нажмите на скрепку → «Видео-кружок»), "
-        f"на котором ваше лицо видно чётко, без бликов, не размазано.\n\n"
-        f"Произнесите вслух: <b>{', '.join(words)}</b>\n\n"
-        "Это нужно для подтверждения возраста. У вас 3 попытки.",
+        "📹 <b>Шаг 2: Подтверждение личности</b>\n\n"
+        "Пожалуйста, запишите <b>видео-кружок</b> (нажмите на скрепку → «Видео-кружок»), на котором ваше лицо видно чётко, без бликов и размытия.\n\n"
+        f"В кружке вы должны громко и чётко произнести следующие слова: <b>{words_str}</b>\n\n"
+        "<i>Это необходимо для подтверждения вашего возраста и того, что вы реальный человек. У вас есть 3 попытки, после чего бот заблокирует вас.</i>",
         parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
 
 @router.message(S.video)
@@ -202,10 +233,10 @@ async def on_video(m: Message, state: FSMContext):
         if left <= 0:
             await upsert_user(m.from_user.id, banned=1, ban_reason="Не прошёл верификацию")
             await state.clear()
-            return await m.answer("🚫 Вы исчерпали попытки. Доступ заблокирован.")
+            return await m.answer("🚫 Вы исчерпали лимит попыток. Доступ к боту заблокирован.")
         await upsert_user(m.from_user.id, attempts_left=left)
-        return await m.answer(f"❌ Вы прислали не видео-кружок. Осталось попыток: {left}. "
-                              "После этого доступ будет заблокирован.")
+        return await m.answer(f"❌ Вы прислали не видео-кружок. Пожалуйста, запишите именно кружок.\nОсталось попыток: <b>{left}</b>. После этого доступ будет заблокирован.", parse_mode="HTML")
+    
     await upsert_user(m.from_user.id, status="awaiting_form", video_used=1)
     await state.set_state(S.form)
     await m.answer("✅ Видео принято.")
@@ -231,11 +262,12 @@ async def ask_form(m: Message, u: dict, video_note_file_id: Optional[str] = None
     lim = await vip_limits(u)
     chars = max(u.get("chars_limit") or 300, lim["chars"])
     await m.answer(
-        "📝 Заполните анкету, скопировав шаблон тапом ниже:\n\n"
+        "📝 <b>Шаг 3: Заполнение анкеты</b>\n\n"
+        "Пожалуйста, скопируйте шаблон ниже (тапните по нему) и заполните его. Отправьте заполненный текст одним сообщением.\n\n"
         f"{FORM_TEMPLATE}\n\n"
-        f"Лимит символов: <b>{chars}</b>.\n"
-        "По желанию прикрепите 1 фото в этом же сообщении.\n"
-        "Возраст от 12 лет.",
+        f"⚠️ <b>Лимит символов:</b> <b>{chars}</b>.\n"
+        "📸 По желанию вы можете прикрепить одно фото к этому сообщению (анкета с фото получает больше лайков).\n"
+        "🔞 Возраст от 12 лет.",
         parse_mode="HTML")
 
 def parse_form(text: str):
@@ -279,13 +311,13 @@ async def on_form(m: Message, state: FSMContext):
         
     data = parse_form(text)
     if not data:
-        return await m.answer("❌ Анкета заполнена не по форме. Заполните точно по шаблону.\n\n" + FORM_TEMPLATE, parse_mode="HTML")
+        return await m.answer("❌ <b>Анкета заполнена не по форме!</b>\n\nПожалуйста, строго следуйте шаблону (включая цифры и двоеточия). Скопируйте шаблон ниже и впишите свои данные:\n\n" + FORM_TEMPLATE, parse_mode="HTML")
         
     lim = await vip_limits(u)
     chars_limit = max(u.get("chars_limit") or 300, lim["chars"])
     for k in ["reason", "hobby", "diagnosis"]:
         if len(data[k]) > chars_limit:
-            return await m.answer(f"❌ Поле «{k}» превышает лимит {chars_limit} символов.")
+            return await m.answer(f"❌ Поле «{k}» превышает лимит в {chars_limit} символов. Пожалуйста, сократите текст.", parse_mode="HTML")
             
     photo1 = None
     if m.photo:
@@ -303,16 +335,25 @@ async def on_form(m: Message, state: FSMContext):
         
     await upsert_user(m.from_user.id, status="pending_review")
     await state.clear()
-    await m.answer("📨 Анкета отправлена на проверку. Ожидайте решения модератора.")
+    await m.answer("📨 Ваша анкета успешно отправлена на модерацию!\nПожалуйста, ожидайте решения. Мы напишем вам, как только проверим её.")
     await send_to_admin_chat(m.bot, prof, u)
 
 async def send_to_admin_chat(bot: Bot, prof: dict, u: dict):
+    global ADMIN_CHAT_ID
+    verify_words = u.get("verify_words") or "—"
+    
     text = (
-        f"🆕 <b>Новая анкета</b>\n"
-        f"tg_id: <code>{prof['tg_id']}</code>\n"
-        f"📞 {u.get('phone')}\n\n"
-        f"1. {prof['name']}\n2. {prof['age']}\n3. {prof['pronouns']}\n"
-        f"4. {prof['city']}\n5. {prof['diagnosis']}\n6. {prof['reason']}\n7. {prof['hobby']}"
+        f"🆕 <b>Новая анкета на модерацию</b>\n\n"
+        f"👤 <b>Пользователь:</b> <code>{prof['tg_id']}</code>\n"
+        f"📞 <b>Телефон:</b> {u.get('phone')}\n"
+        f"🗣 <b>Слова в кружке:</b> {verify_words}\n\n"
+        f"<b>Анкета:</b>\n"
+        f"👤 <b>{prof['name']}</b>, {prof['age']}\n"
+        f"🏳️‍🌈 Местоимения: {prof['pronouns']}\n"
+        f"📍 Город: {prof['city']}\n"
+        f"🩺 Диагноз: {prof['diagnosis']}\n"
+        f"💭 Зачем пришёл/ла: {prof['reason']}\n"
+        f"🎨 Хобби: {prof['hobby']}"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Принять", callback_data=f"adm:approve:{prof['tg_id']}"),
@@ -320,6 +361,14 @@ async def send_to_admin_chat(bot: Bot, prof: dict, u: dict):
         [InlineKeyboardButton(text="✏️ Переделать", callback_data=f"adm:rework:{prof['tg_id']}")],
     ])
     try:
+        if prof.get("video"):
+            await bot.send_video_note(ADMIN_CHAT_ID, prof["video"])
+        if prof.get("photo1"):
+            await bot.send_photo(ADMIN_CHAT_ID, prof["photo1"])
+        await bot.send_message(ADMIN_CHAT_ID, text, reply_markup=kb, parse_mode="HTML")
+    except TelegramMigrateToChat as e:
+        ADMIN_CHAT_ID = e.migrate_to_chat_id
+        log.warning(f"Админ-чат мигрировал. Новый ID: {ADMIN_CHAT_ID}")
         if prof.get("video"):
             await bot.send_video_note(ADMIN_CHAT_ID, prof["video"])
         if prof.get("photo1"):
@@ -339,18 +388,23 @@ async def adm_verify(cb: CallbackQuery, state: FSMContext):
             await db.execute("UPDATE profiles SET approved=1 WHERE tg_id=?", (tid,))
             await db.execute("UPDATE users SET status='active', banned=0 WHERE tg_id=?", (tid,))
             await db.commit()
-        await cb.bot.send_message(tid, "🎉 Ваша анкета одобрена! Добро пожаловать в «Кленовый букетик».")
+        await cb.bot.send_message(
+            tid, 
+            "🎉 <b>Ваша анкета одобрена!</b>\nДобро пожаловать в «Кленчик». Теперь вам доступны все функции.\n\nВыберите раздел ниже:", 
+            reply_markup=main_menu_kb(), 
+            parse_mode="HTML"
+        )
         await cb.message.edit_reply_markup(reply_markup=None)
     elif action == "reject":
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("UPDATE users SET status='banned', banned=1, ban_reason='Отклонено модератором' WHERE tg_id=?", (tid,))
             await db.commit()
-        await cb.bot.send_message(tid, "🚫 Ваша анкета отклонена. Доступ к боту заблокирован.")
+        await cb.bot.send_message(tid, "🚫 К сожалению, ваша анкета была отклонена. Доступ к боту заблокирован.")
         await cb.message.edit_reply_markup(reply_markup=None)
     elif action == "rework":
         await state.set_state(S.admin_wait_comment)
         await state.update_data(rework_tid=tid)
-        await cb.message.answer(f"Введите комментарий для пользователя {tid}:")
+        await cb.message.answer(f"Введите комментарий для пользователя {tid} (что именно нужно исправить):")
     await cb.answer()
 
 @router.message(S.admin_wait_comment)
@@ -366,12 +420,12 @@ async def rework_comment(m: Message, state: FSMContext):
         await db.execute("UPDATE profiles SET approved=0 WHERE tg_id=?", (tid,))
         await db.execute("UPDATE users SET status='awaiting_form' WHERE tg_id=?", (tid,))
         await db.commit()
-    await m.bot.send_message(tid, f"✏️ Вашу анкету нужно переделать.\nКомментарий: {m.text}\n\nОтправьте /start чтобы заполнить заново.")
+    await m.bot.send_message(tid, f"✏️ <b>Вашу анкету нужно переделать.</b>\n\n💬 <b>Комментарий модератора:</b>\n{m.text}\n\nПожалуйста, отправьте /start, чтобы заполнить анкету заново.", parse_mode="HTML")
     await m.answer("Комментарий отправлен пользователю.")
 
 def main_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🗂 Анкеты", callback_data="menu:ankety")],
+        [InlineKeyboardButton(text="🗂 Смотреть анкеты", callback_data="menu:ankety")],
         [InlineKeyboardButton(text="💬 Чат инкогнито", callback_data="menu:incognito")],
         [InlineKeyboardButton(text="🛒 Магазин", callback_data="menu:shop")],
         [InlineKeyboardButton(text="🆘 Поддержка", callback_data="menu:support")],
@@ -392,7 +446,7 @@ async def ankety(cb: CallbackQuery):
     await refresh_likes(cb.from_user.id)
     u = await get_user(cb.from_user.id)
     if u["likes_left"] <= 0:
-        return await cb.answer("Лимит лайков исчерпан. Купите доп в магазине.", show_alert=True)
+        return await cb.answer("Лимит лайков исчерпан. Вы можете купить доп в магазине.", show_alert=True)
     await show_next_profile(cb, 0)
 
 async def show_next_profile(cb: CallbackQuery, offset: int):
@@ -404,18 +458,18 @@ async def show_next_profile(cb: CallbackQuery, offset: int):
             (cb.from_user.id, offset))
         prof = await cur.fetchone()
     if not prof:
-        return await cb.answer("Больше анкет нет.", show_alert=True)
+        return await cb.answer("На данный момент анкет больше нет.", show_alert=True)
     prof = dict(prof)
-    text = (f"<b>{prof['name']}</b>, {prof['age']}\n"
-            f"📍 {prof['city']} · {prof['pronouns']}\n"
-            f"🩺 {prof['diagnosis']}\n"
-            f"💭 {prof['reason']}\n"
-            f"🎨 {prof['hobby']}")
+    text = (f"👤 <b>{prof['name']}</b>, {prof['age']} ({prof['pronouns']})\n"
+            f"📍 {prof['city']}\n\n"
+            f"🩺 <b>Диагноз:</b> {prof['diagnosis']}\n"
+            f"💭 <b>Ищет:</b> {prof['reason']}\n"
+            f"🎨 <b>Хобби:</b> {prof['hobby']}")
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❤️ Лайк", callback_data=f"like:{prof['tg_id']}"),
-         InlineKeyboardButton(text="➡️ Скип", callback_data=f"skip:{offset+1}")],
+         InlineKeyboardButton(text="➡️ Пропустить", callback_data=f"skip:{offset+1}")],
         [InlineKeyboardButton(text="🚨 Жалоба", callback_data=f"report:{prof['tg_id']}")],
-        [InlineKeyboardButton(text="⬅️ Меню", callback_data="menu:back")],
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:back")],
     ])
     if prof.get("photo1"):
         await cb.message.answer_photo(prof["photo1"], caption=text, reply_markup=kb, parse_mode="HTML")
@@ -425,7 +479,7 @@ async def show_next_profile(cb: CallbackQuery, offset: int):
 @router.callback_query(F.data.startswith("skip:"))
 async def skip(cb: CallbackQuery):
     offset = int(cb.data.split(":")[1])
-    await cb.answer("Скип")
+    await cb.answer("Анкета пропущена")
     await show_next_profile(cb, offset)
 
 @router.callback_query(F.data.startswith("like:"))
@@ -434,7 +488,7 @@ async def like(cb: CallbackQuery):
     await refresh_likes(cb.from_user.id)
     u = await get_user(cb.from_user.id)
     if u["likes_left"] <= 0:
-        return await cb.answer("Лимит исчерпан.", show_alert=True)
+        return await cb.answer("Лимит лайков исчерпан.", show_alert=True)
     await upsert_user(cb.from_user.id, likes_left=u["likes_left"] - 1)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT INTO likes(from_tg, to_tg, created_at) VALUES(?,?,?)",
@@ -445,7 +499,7 @@ async def like(cb: CallbackQuery):
         mutual = await cur.fetchone()
     if mutual:
         try:
-            await cb.bot.send_message(target, "💞 Взаимный лайк! Зайдите в раздел «Чат инкогнито».")
+            await cb.bot.send_message(target, "💞 <b>Взаимный лайк!</b> Зайдите в раздел «Чат инкогнито», чтобы начать общение.", parse_mode="HTML")
         except Exception:
             pass
         await cb.message.answer("💞 Взаимно! Человек получил уведомление.")
@@ -456,37 +510,54 @@ async def like(cb: CallbackQuery):
 async def incognito(cb: CallbackQuery):
     u = await get_user(cb.from_user.id)
     if u["vip_level"] == 0:
-        return await cb.answer("Доступ по VIP или купите дневной доп.", show_alert=True)
+        return await cb.answer("Доступно только с VIP-статусом или после покупки дневного допа.", show_alert=True)
     await cb.message.answer("💬 Отправьте сообщение — оно уйдёт анонимно человеку, с которым у вас взаимный лайк.")
     await cb.answer()
 
-SHOP_ITEMS = {
-    "vip_low": "VIP Низкий: 40 лайков/день, 600 символов, приоритет выше. 300₽/мес",
-    "vip_mid": "VIP Средний: 60 лайков, 800 символов, 2 фото. 500₽/мес",
-    "vip_high": "VIP Высокий: ∞ лайки, 1000 символов, видео, откат. 700₽/мес",
-    "chars_600": "Лимит символов до 600. 40₽",
-    "unlimited_likes": "Снятие лимита лайков на день. 200₽",
-    "prev_anketa": "Возврат предыдущей анкеты. 80₽",
-    "second_media": "Второе фото/видео. 60₽",
-    "incognito_day": "Чат инкогнито на день. 30₽",
-}
-
 @router.callback_query(F.data == "menu:shop")
 async def shop(cb: CallbackQuery):
-    rows = [[InlineKeyboardButton(text=k, callback_data=f"buyinfo:{k}")] for k in SHOP_ITEMS]
-    rows.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="menu:back")])
-    await cb.message.edit_text("🛒 Магазин\nВыберите товар:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    rows = [
+        [InlineKeyboardButton(text="🟢 VIP Низкий", callback_data="buyinfo:vip_low")],
+        [InlineKeyboardButton(text="🟡 VIP Средний", callback_data="buyinfo:vip_mid")],
+        [InlineKeyboardButton(text="🔴 VIP Высокий", callback_data="buyinfo:vip_high")],
+        [InlineKeyboardButton(text="📝 Символы до 600", callback_data="buyinfo:chars_600")],
+        [InlineKeyboardButton(text="❤️ Безлимит лайков (1 день)", callback_data="buyinfo:unlimited_likes")],
+        [InlineKeyboardButton(text="⏪ Возврат предыдущей анкеты", callback_data="buyinfo:prev_anketa")],
+        [InlineKeyboardButton(text="📸 Второе фото/видео", callback_data="buyinfo:second_media")],
+        [InlineKeyboardButton(text="🕵️ Чат инкогнито (1 день)", callback_data="buyinfo:incognito_day")],
+        [InlineKeyboardButton(text="⬅️ Меню", callback_data="menu:back")],
+    ]
+    await cb.message.edit_text("🛒 <b>Магазин</b>\nВыберите товар для подробностей:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
     await cb.answer()
 
 @router.callback_query(F.data.startswith("buyinfo:"))
 async def buy_info(cb: CallbackQuery):
     key = cb.data.split(":")[1]
-    text = SHOP_ITEMS.get(key, "—")
+    
+    if key == "vip_low":
+        text = "🟢 <b>VIP Низкий</b> (300₽ / 1 месяц)\n\n• 40 лайков в день\n• Лимит символов в анкете: 600\n• Приоритет в выдаче анкет: средний"
+    elif key == "vip_mid":
+        text = "🟡 <b>VIP Средний</b> (500₽ / 1 месяц)\n\n• 60 лайков в день\n• Лимит символов в анкете: 800\n• Возможность загрузить 2 фото\n• Приоритет в выдаче анкет: повышенный"
+    elif key == "vip_high":
+        text = "🔴 <b>VIP Высокий</b> (700₽ / 1 месяц)\n\n• Безлимитные лайки\n• Лимит символов: 1000\n• Возможность загрузить 2 фото и видео (15 сек)\n• Возврат к предыдущей анкете\n• Приоритет в выдаче анкет: максимальный"
+    elif key == "chars_600":
+        text = "📝 <b>Лимит символов до 600</b> (40₽)\n\nРазблокирует возможность писать более длинные тексты в анкете (до 600 символов вместо 300)."
+    elif key == "unlimited_likes":
+        text = "❤️ <b>Снятие лимита лайков</b> (200₽)\n\nПозволяет ставить безлимитное количество лайков на 1 день."
+    elif key == "prev_anketa":
+        text = "⏪ <b>Возврат предыдущей анкеты</b> (80₽)\n\nЕсли вы случайно пропустили (скипнули) интересного человека, эта функция позволит вернуться к его анкете."
+    elif key == "second_media":
+        text = "📸 <b>Второе фото/видео</b> (60₽)\n\nПозволяет прикрепить дополнительное фото (или видео) к вашей анкете."
+    elif key == "incognito_day":
+        text = "🕵️ <b>Чат инкогнито</b> (30₽ / день)\n\nОткрывает доступ к анонимной переписке с теми, с кем у вас взаимный лайк."
+    else:
+        text = "Описание отсутствует."
+        
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💳 Купить", callback_data=f"buy:{key}")],
         [InlineKeyboardButton(text="⬅️ Магазин", callback_data="menu:shop")],
     ])
-    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     await cb.answer()
 
 @router.callback_query(F.data.startswith("buy:"))
@@ -494,9 +565,9 @@ async def buy(cb: CallbackQuery):
     key = cb.data.split(":")[1]
     price, name = PRICES[key]
     await cb.message.edit_text(
-        f"Оплата: <b>{name}</b> — {price}₽.\n\n"
+        f"💳 Оплата: <b>{name}</b> — {price}₽.\n\n"
         f"Перейдите по ссылке и оплатите: {PAYMENT_LINK}\n"
-        "После оплаты администратор выдаст доступ вручную.",
+        f"После оплаты администратор проверит платёж и выдаст вам доступ вручную.",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:shop")]]))
     await cb.bot.send_message(SUPERADMIN_ID,
@@ -506,7 +577,7 @@ async def buy(cb: CallbackQuery):
 @router.callback_query(F.data == "menu:support")
 async def support(cb: CallbackQuery, state: FSMContext):
     await state.set_state(S.support)
-    await cb.message.answer(f"🆘 Опишите проблему одним сообщением. Поддержка: {SUPPORT_USERNAME}")
+    await cb.message.answer(f"🆘 Опишите вашу проблему одним сообщением. Поддержка: {SUPPORT_USERNAME}")
     await cb.answer()
 
 @router.message(S.support)
@@ -523,26 +594,6 @@ async def support_msg(m: Message, state: FSMContext):
     await state.clear()
     await m.answer("✅ Обращение отправлено. Ожидайте ответа.")
 
-@router.message(Command("reply"))
-async def reply_ticket(m: Message):
-    if m.from_user.id != SUPERADMIN_ID:
-        return
-    parts = m.text.split(" ", 2)
-    if len(parts) < 3:
-        return await m.answer("Формат: /reply <ticket_id> <текст>")
-    tid, txt = int(parts[1]), parts[2]
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT tg_id FROM tickets WHERE id=?", (tid,))
-        t = await cur.fetchone()
-        if not t:
-            return await m.answer("Тикет не найден.")
-        await db.execute("INSERT INTO ticket_msgs(ticket_id, from_admin, text, created_at) VALUES(?,?,?,?)",
-                         (tid, 1, txt, now()))
-        await db.commit()
-    await m.bot.send_message(t["tg_id"], f"🆘 Ответ поддержки по тикету #{tid}:\n\n{txt}")
-    await m.answer("Ответ отправлен.")
-
 @router.callback_query(F.data == "menu:profile")
 async def my_profile(cb: CallbackQuery):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -553,10 +604,15 @@ async def my_profile(cb: CallbackQuery):
         return await cb.answer("Анкета не найдена", show_alert=True)
     prof = dict(prof)
     u = await get_user(cb.from_user.id)
-    text = (f"<b>Моя анкета</b>\n\n{prof['name']}, {prof['age']}\n"
-            f"📍 {prof['city']}\n5. {prof['diagnosis']}\n6. {prof['reason']}\n7. {prof['hobby']}\n\n"
-            f"VIP: {u['vip_level']} до {u['vip_until'] or '—'}\n"
-            f"Лайков: {u['likes_left']}\nСтатус: {u['status']}")
+    text = (f"👤 <b>Моя анкета</b>\n\n"
+            f"<b>{prof['name']}</b>, {prof['age']} ({prof['pronouns']})\n"
+            f"📍 {prof['city']}\n"
+            f"🩺 {prof['diagnosis']}\n"
+            f"💭 {prof['reason']}\n"
+            f"🎨 {prof['hobby']}\n\n"
+            f"👑 <b>VIP:</b> {u['vip_level']} (до {u['vip_until'] or '—'})\n"
+            f"❤️ <b>Лайков:</b> {u['likes_left']}\n"
+            f"⚙️ <b>Статус:</b> {u['status']}")
     await cb.message.answer(text, parse_mode="HTML")
     await cb.answer()
 
@@ -565,7 +621,7 @@ async def report(cb: CallbackQuery, state: FSMContext):
     target = int(cb.data.split(":")[1])
     await state.set_state(S.report_reason)
     await state.update_data(target=target)
-    await cb.message.answer("Опишите причину жалобы:")
+    await cb.message.answer("Опишите причину жалобы на этого пользователя:")
     await cb.answer()
 
 @router.message(S.report_reason)
@@ -579,12 +635,6 @@ async def report_reason(m: Message, state: FSMContext):
         f"🚨 Жалоба от {m.from_user.id} на {data['target']}:\n{m.text}")
     await state.clear()
     await m.answer("✅ Жалоба отправлена.")
-
-@router.message(Command("admin"))
-async def admin(m: Message):
-    if m.from_user.id != SUPERADMIN_ID:
-        return
-    await m.answer("🛠 <b>Админ-панель</b>", reply_markup=admin_kb(), parse_mode="HTML")
 
 def admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -783,7 +833,7 @@ async def pm_router(m: Message, state: FSMContext):
         return
     if m.text and m.text.startswith("/"):
         return
-    await m.answer("Используйте /start для навигации.")
+    await m.answer("Используйте /start для навигации по боту.")
 
 async def main():
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
