@@ -132,6 +132,10 @@ def _init_db():
         except Exception:
             pass
 
+        # Конвертируем старые даты (2100+) в 'forever'
+        conn.execute("UPDATE users SET anon_until='forever' WHERE anon_until LIKE '21%'")
+        conn.execute("UPDATE users SET vip_until='forever' WHERE vip_until LIKE '21%'")
+
         for k, v in {
             "vip1": int(os.getenv("VIP1_PRICE") or 200),
             "vip2": int(os.getenv("VIP2_PRICE") or 350),
@@ -146,10 +150,23 @@ def _init_db():
 _init_db()
 
 
+def is_forever(iso_str):
+    if not iso_str:
+        return False
+    if str(iso_str).lower() == 'forever':
+        return True
+    try:
+        if int(str(iso_str)[:4]) > 2100:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def fmt_dt(iso_str):
     if not iso_str:
         return "—"
-    if str(iso_str).lower() == 'forever':
+    if is_forever(iso_str):
         return "Навсегда"
     try:
         dt = datetime.fromisoformat(iso_str)
@@ -166,11 +183,12 @@ def db_get_user(uid, tg_user=None):
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
         now_iso = datetime.now(timezone.utc).isoformat()
+        today_msk = datetime.now(MSK).date().isoformat()
         
         if not row:
             conn.execute(
                 "INSERT OR IGNORE INTO users(user_id,created_at,likes_date,anon_free_date,last_seen) VALUES(?,?,?,?,?)",
-                (uid, now_iso, now_iso[:10], now_iso[:10], now_iso),
+                (uid, now_iso, today_msk, today_msk, now_iso),
             )
             conn.commit()
             row = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
@@ -260,7 +278,7 @@ def ensure_daily_likes(uid):
 
 def add_days(base_iso, days):
     now = datetime.now(timezone.utc)
-    if base_iso and str(base_iso).lower() == 'forever':
+    if is_forever(base_iso):
         return 'forever'
     if base_iso:
         try:
@@ -493,7 +511,7 @@ def anon_time_left(uid):
         db_set(uid, anon_free_date=today, anon_free_used=0)
         u = db_get_user(uid)
         
-    if u["anon_until"] == 'forever':
+    if is_forever(u["anon_until"]):
         return 99999999
         
     if u["anon_until"]:
@@ -572,6 +590,11 @@ async def moderation_mw(update, ctx):
 
 
 async def cmd_start(update, ctx):
+    now = time.time()
+    if now - ctx.user_data.get("last_start", 0) < 3:
+        return
+    ctx.user_data["last_start"] = now
+
     msg = update.effective_message
     uid = update.effective_user.id
     if get_partner(uid):
@@ -804,7 +827,6 @@ async def private_message(update, ctx):
         await handle_profile_edit(update, ctx, u, msg.text)
         raise ApplicationHandlerStop
 
-    # Защита от спама
     now = time.time()
 
     if not u["agreed"]:
@@ -1173,6 +1195,11 @@ async def show_profile(q, uid):
 
 async def cb_like(update, ctx):
     q = update.callback_query
+    now = time.time()
+    if now - ctx.user_data.get("last_like", 0) < 1:
+        return await q.answer("Не так быстро!", show_alert=False)
+    ctx.user_data["last_like"] = now
+
     uid = q.from_user.id
     target = int(q.data.split(":")[1])
     await q.answer()
@@ -1205,7 +1232,7 @@ async def cb_like(update, ctx):
                 return
             conn.execute(
                 "INSERT INTO likes(from_id,to_id,ts) VALUES(?,?,?)",
-                (uid, target, datetime.now(timezone.utc).isoformat()),
+                (uid, target, datetime.now(MSK).isoformat()),
             )
             conn.commit()
             mutual = conn.execute(
@@ -1278,6 +1305,11 @@ async def cb_view_liker(update, ctx):
 
 async def cb_skip(update, ctx):
     q = update.callback_query
+    now = time.time()
+    if now - ctx.user_data.get("last_skip", 0) < 1:
+        return await q.answer()
+    ctx.user_data["last_skip"] = now
+
     await q.answer()
     uid = q.from_user.id
     target = int(q.data.split(":")[1])
@@ -1286,7 +1318,7 @@ async def cb_skip(update, ctx):
         with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
             conn.execute(
                 "INSERT INTO skips(from_id,to_id,ts) VALUES(?,?,?)",
-                (uid, target, datetime.now(timezone.utc).isoformat())
+                (uid, target, datetime.now(MSK).isoformat())
             )
             conn.commit()
     except Exception:
@@ -1375,7 +1407,7 @@ async def cb_menu_profile(update, ctx):
     
     vip_str = vip_label(u['vip'])
     if u['vip'] > 0 and u['vip_until']:
-        if u['vip_until'] == 'forever':
+        if is_forever(u['vip_until']):
             vip_str += " (Навсегда)"
         else:
             vip_str += f" (до {fmt_dt(u['vip_until'])})"
@@ -1390,7 +1422,7 @@ async def cb_menu_profile(update, ctx):
         f"Лимит символов: {'∞' if vip_char_limit(u['vip']) >= 10**9 else vip_char_limit(u['vip'])}\n"
     )
     if u["anon_until"]:
-        if u["anon_until"] == 'forever':
+        if is_forever(u["anon_until"]):
             text += "Анон-доступ: Навсегда\n"
         else:
             text += f"Анон-доступ до: {fmt_dt(u['anon_until'])}\n"
