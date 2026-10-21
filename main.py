@@ -15,7 +15,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, BotCommand,
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
 )
 import aiosqlite
 from dotenv import load_dotenv
@@ -782,10 +782,6 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     await db_init()
-    await bot.set_my_commands([
-        BotCommand(command="start", description="Главное меню"),
-        BotCommand(command="admin", description="Админ-панель"),
-    ])
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
