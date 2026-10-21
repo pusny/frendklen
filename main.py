@@ -77,7 +77,7 @@ def _init_db():
             approved INTEGER DEFAULT 0, rejected INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS anon_queue (
-            user_id INTEGER PRIMARY KEY, ts TEXT
+            user_id INTEGER PRIMARY KEY, ts TEXT, msg_id INTEGER
         );
         CREATE TABLE IF NOT EXISTS anon_pairs (
             user_a INTEGER, user_b INTEGER, ts TEXT,
@@ -86,21 +86,38 @@ def _init_db():
         CREATE TABLE IF NOT EXISTS prices (key TEXT PRIMARY KEY, val INTEGER);
         CREATE TABLE IF NOT EXISTS admin_msgs (msg_id INTEGER PRIMARY KEY, user_id INTEGER, mtype TEXT);
         """)
+
         cols_u = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
         if "full_name" not in cols_u:
             conn.execute("ALTER TABLE users ADD COLUMN full_name TEXT")
 
-        cols_l = {r[1] for r in conn.execute("PRAGMA table_info(likes)").fetchall()}
+        cols_q = {r[1] for r in conn.execute("PRAGMA table_info(anon_queue)").fetchall()}
+        if "msg_id" not in cols_q:
+            conn.execute("ALTER TABLE anon_queue ADD COLUMN msg_id INTEGER")
+
+        try:
+            cols_l = {r[1] for r in conn.execute("PRAGMA table_info(likes)").fetchall()}
+        except Exception:
+            cols_l = set()
+
         if cols_l and "id" not in cols_l:
             try:
-                conn.execute("ALTER TABLE likes RENAME TO likes_old")
+                conn.execute("DROP TABLE IF EXISTS likes_old_mig")
+                conn.execute("ALTER TABLE likes RENAME TO likes_old_mig")
                 conn.execute("CREATE TABLE likes (id INTEGER PRIMARY KEY AUTOINCREMENT, from_id INTEGER, to_id INTEGER, ts TEXT)")
-                conn.execute("INSERT INTO likes(from_id,to_id,ts) SELECT from_id,to_id,ts FROM likes_old")
-                conn.execute("DROP TABLE likes_old")
+                conn.execute("INSERT INTO likes(from_id,to_id,ts) SELECT from_id,to_id,ts FROM likes_old_mig")
+                conn.execute("DROP TABLE likes_old_mig")
             except Exception:
-                pass
-        conn.execute("CREATE TABLE IF NOT EXISTS likes (id INTEGER PRIMARY KEY AUTOINCREMENT, from_id INTEGER, to_id INTEGER, ts TEXT)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_likes_ft ON likes(from_id, to_id, ts)")
+                try:
+                    conn.execute("DROP TABLE IF EXISTS likes_old_mig")
+                except Exception:
+                    pass
+
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS likes (id INTEGER PRIMARY KEY AUTOINCREMENT, from_id INTEGER, to_id INTEGER, ts TEXT)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_likes_ft ON likes(from_id, to_id, ts)")
+        except Exception:
+            pass
 
         for k, v in {
             "vip1": int(os.getenv("VIP1_PRICE") or 200),
@@ -237,16 +254,6 @@ def parse_profile(text):
     if len(data) < 5 or any(not v for v in data.values()):
         return None
     return data
-
-
-def fmt_profile_fields(p):
-    return (
-        f"Имя: {escape(str(p['name']))}\n"
-        f"Возраст: {escape(str(p['age']))}\n"
-        f"Город: {escape(str(p['city']))}\n"
-        f"Диагноз: {escape(str(p['diagnosis']))}\n"
-        f"О себе: {escape(str(p['about']))}"
-    )
 
 
 AGREEMENT_TEXT = (
@@ -502,7 +509,7 @@ async def cmd_start(update, ctx):
     msg = update.effective_message
     uid = update.effective_user.id
     if get_partner(uid):
-        return await msg.reply_text("🛑 Сначала завершите анонимный чат через кнопку «Стоп».")
+        return await msg.reply_text("🛑 Сначала завершите анонимный чат через кнопку «Стоп».", reply_markup=kb_anon())
     u = db_get_user(uid, update.effective_user)
     if u["banned"]:
         return await msg.reply_text(
@@ -769,8 +776,9 @@ async def anon_relay(update, ctx):
         await safe_send(
             ctx.bot, uid,
             f"⏰ Время вышло. Купите доступ на {ANON_PAID_DAYS} дн. за {price}₽ у {MANAGER}.",
+            reply_markup=kb_anon(),
         )
-        await safe_send(ctx.bot, partner, "🛑 Собеседник отключился.")
+        await safe_send(ctx.bot, partner, "🛑 Собеседник отключился.", reply_markup=kb_anon())
         raise ApplicationHandlerStop
     try:
         await ctx.bot.copy_message(partner, msg.chat.id, msg.message_id)
@@ -915,50 +923,92 @@ async def cb_agree_no(update, ctx):
 
 async def cb_menu_main(update, ctx):
     q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
     uid = q.from_user.id
     ctx.user_data.pop("support_mode", None)
     ctx.user_data.pop("edit_text_mode", None)
-    u = db_get_user(uid, q.from_user)
     p = db_get_profile(uid)
     if uid != ADMIN_ID and (not p or not p["approved"]):
-        await q.message.edit_text(
-            "⏳ <b>Ваша анкета на модерации.</b>\n\n"
-            "Доступ к функциям бота откроется после одобрения администратором.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔄 Проверить статус", callback_data="menu:main"),
-            ]]),
-        )
-        await q.answer()
+        try:
+            await q.message.edit_text(
+                "⏳ <b>Ваша анкета на модерации.</b>\n\n"
+                "Доступ к функциям бота откроется после одобрения администратором.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔄 Проверить статус", callback_data="menu:main"),
+                ]]),
+            )
+        except Exception:
+            pass
         return
-    await q.message.edit_text(
-        "🍁 <b>Главное меню</b>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb_main(uid == ADMIN_ID),
-    )
-    await q.answer()
+    try:
+        await q.message.edit_text(
+            "🍁 <b>Главное меню</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_main(uid == ADMIN_ID),
+        )
+    except Exception:
+        pass
 
 
 async def cb_menu_profiles(update, ctx):
     q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
     uid = q.from_user.id
-    await ensure_daily_likes(uid)
-    await show_profile(q, uid)
-    await q.answer()
+    try:
+        await ensure_daily_likes(uid)
+    except Exception:
+        pass
+    try:
+        await show_profile(q, uid)
+    except Exception as e:
+        try:
+            await q.message.answer(
+                f"⚠️ <b>Не удалось показать анкету</b>\n<code>{escape(str(e))}</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_back("menu:main"),
+            )
+        except Exception:
+            pass
 
 
 async def show_profile(q, uid):
     today = datetime.now(timezone.utc).date().isoformat()
-    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
-        conn.row_factory = sqlite3.Row
-        r = conn.execute("""
-            SELECT p.* FROM profiles p
-            WHERE p.approved=1 AND p.user_id != ?
-              AND p.user_id NOT IN (
-                  SELECT to_id FROM likes WHERE from_id=? AND substr(ts,1,10)=?
-              )
-            ORDER BY RANDOM() LIMIT 1
-        """, (uid, uid, today)).fetchone()
+    r = None
+    try:
+        with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+            conn.row_factory = sqlite3.Row
+            r = conn.execute(
+                "SELECT p.* FROM profiles p "
+                "WHERE p.approved=1 AND p.user_id != ? "
+                "  AND p.user_id NOT IN ("
+                "    SELECT to_id FROM likes WHERE from_id=? AND substr(ts,1,10)=?"
+                "  ) "
+                "ORDER BY RANDOM() LIMIT 1",
+                (uid, uid, today),
+            ).fetchone()
+    except Exception:
+        r = None
+
+    if r is None:
+        try:
+            with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+                conn.row_factory = sqlite3.Row
+                r = conn.execute(
+                    "SELECT p.* FROM profiles p "
+                    "WHERE p.approved=1 AND p.user_id != ? "
+                    "ORDER BY RANDOM() LIMIT 1",
+                    (uid,),
+                ).fetchone()
+        except Exception:
+            r = None
+
     if not r:
         try:
             await q.message.edit_text(
@@ -971,31 +1021,41 @@ async def show_profile(q, uid):
         except Exception:
             pass
         return
+
     p = dict(r)
-    u = db_get_user(uid)
+    try:
+        u = db_get_user(uid)
+    except Exception:
+        u = {"vip": 0}
+
     text = (
         f"<b>🍁 Анкета</b>\n\n"
-        f"Имя: {escape(str(p['name']))}\n"
-        f"Возраст: {escape(str(p['age']))}\n"
-        f"Город: {escape(str(p['city']))}\n"
-        f"Диагноз: {escape(str(p['diagnosis']))}\n"
-        f"О себе: {escape(str(p['about']))}"
+        f"Имя: {escape(str(p.get('name') or '—'))}\n"
+        f"Возраст: {escape(str(p.get('age') or '—'))}\n"
+        f"Город: {escape(str(p.get('city') or '—'))}\n"
+        f"Диагноз: {escape(str(p.get('diagnosis') or '—'))}\n"
+        f"О себе: {escape(str(p.get('about') or '—'))}"
     )
     rows = [[
         InlineKeyboardButton("❤️ Лайк", callback_data=f"like:{p['user_id']}"),
         InlineKeyboardButton("➡️ Дальше", callback_data=f"skip:{p['user_id']}"),
         InlineKeyboardButton("🚨", callback_data=f"prof_report:{p['user_id']}"),
     ]]
-    if u["vip"] == 3:
+    if u.get("vip") == 3:
         rows.insert(1, [InlineKeyboardButton("⬅️ Назад", callback_data=f"back:{p['user_id']}")])
     rows.append([InlineKeyboardButton("◀️ В меню", callback_data="menu:main")])
+
     try:
-        await q.message.edit_text(text, parse_mode=ParseMode.HTML,
-                                  reply_markup=InlineKeyboardMarkup(rows))
+        await q.message.edit_text(
+            text, parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
     except Exception:
         try:
-            await q.message.answer(text, parse_mode=ParseMode.HTML,
-                                   reply_markup=InlineKeyboardMarkup(rows))
+            await q.message.answer(
+                text, parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
         except Exception:
             pass
 
@@ -1004,10 +1064,13 @@ async def cb_like(update, ctx):
     q = update.callback_query
     uid = q.from_user.id
     target = int(q.data.split(":")[1])
-    await ensure_daily_likes(uid)
+    await q.answer()
+    try:
+        await ensure_daily_likes(uid)
+    except Exception:
+        pass
     u = db_get_user(uid)
     if u["likes_left"] <= 0:
-        await q.answer()
         try:
             await q.message.edit_text(
                 "⚠️ <b>Лимит лайков на сегодня исчерпан.</b>\n"
@@ -1020,23 +1083,27 @@ async def cb_like(update, ctx):
         return
 
     today = datetime.now(timezone.utc).date().isoformat()
-    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
-        already = conn.execute(
-            "SELECT 1 FROM likes WHERE from_id=? AND to_id=? AND substr(ts,1,10)=?",
-            (uid, target, today),
-        ).fetchone()
-        if already:
-            await q.answer("Вы уже лайкнули этого пользователя сегодня")
-            await show_profile(q, uid)
-            return
-        conn.execute(
-            "INSERT INTO likes(from_id,to_id,ts) VALUES(?,?,?)",
-            (uid, target, datetime.now(timezone.utc).isoformat()),
-        )
-        conn.commit()
-        mutual = conn.execute(
-            "SELECT 1 FROM likes WHERE from_id=? AND to_id=?", (target, uid)
-        ).fetchone()
+    try:
+        with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+            already = conn.execute(
+                "SELECT 1 FROM likes WHERE from_id=? AND to_id=? AND substr(ts,1,10)=?",
+                (uid, target, today),
+            ).fetchone()
+            if already:
+                await q.message.answer("Вы уже лайкнули этого пользователя сегодня")
+                await show_profile(q, uid)
+                return
+            conn.execute(
+                "INSERT INTO likes(from_id,to_id,ts) VALUES(?,?,?)",
+                (uid, target, datetime.now(timezone.utc).isoformat()),
+            )
+            conn.commit()
+            mutual = conn.execute(
+                "SELECT 1 FROM likes WHERE from_id=? AND to_id=?", (target, uid)
+            ).fetchone()
+    except Exception:
+        await q.message.answer("⚠️ Не удалось сохранить лайк. Попробуйте позже.")
+        return
 
     if u["vip"] != 3:
         db_set(uid, likes_left=u["likes_left"] - 1)
@@ -1065,26 +1132,32 @@ async def cb_like(update, ctx):
     else:
         await safe_send(ctx.bot, target, "❤️ Кто-то лайкнул вашу анкету. Возможно, взаимно!")
 
-    await q.answer("❤️ Лайк отправлен")
     await show_profile(q, uid)
 
 
 async def cb_skip(update, ctx):
     q = update.callback_query
     await q.answer()
-    await show_profile(q, q.from_user.id)
+    try:
+        await show_profile(q, q.from_user.id)
+    except Exception as e:
+        try:
+            await q.message.answer(f"⚠️ <code>{escape(str(e))}</code>", parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
 
 
 async def cb_back_profile(update, ctx):
     q = update.callback_query
+    await q.answer()
     uid = q.from_user.id
     u = db_get_user(uid)
     if u["vip"] != 3:
-        return await q.answer("Доступно только с VIP 3", show_alert=True)
+        return
     target = int(q.data.split(":")[1])
     p = db_get_profile(target)
     if not p:
-        return await q.answer("Анкета недоступна", show_alert=True)
+        return
     text = (
         f"<b>🍁 Анкета</b>\n\n"
         f"Имя: {escape(str(p['name']))}\n"
@@ -1101,17 +1174,20 @@ async def cb_back_profile(update, ctx):
     try:
         await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
     except Exception:
-        await q.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
-    await q.answer()
+        try:
+            await q.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+        except Exception:
+            pass
 
 
 async def cb_prof_report(update, ctx):
     q = update.callback_query
+    await q.answer("🚨 Жалоба отправлена", show_alert=True)
     reporter = q.from_user.id
     target = int(q.data.split(":")[1])
     p = db_get_profile(target)
     if not p:
-        return await q.answer("Анкета недоступна", show_alert=True)
+        return
     text = (
         f"🚨 <b>Жалоба на анкету</b>\n"
         f"От: <code>{reporter}</code> @{escape(q.from_user.username or '-')}\n"
@@ -1124,11 +1200,11 @@ async def cb_prof_report(update, ctx):
         f"О себе: {escape(str(p['about']))}"
     )
     await to_admin(ctx.bot, TOPIC_REPORTS, text, reply_markup=kb_report(target))
-    await q.answer("🚨 Жалоба отправлена", show_alert=True)
 
 
 async def cb_menu_profile(update, ctx):
     q = update.callback_query
+    await q.answer()
     uid = q.from_user.id
     u = db_get_user(uid, q.from_user)
     p = db_get_profile(uid)
@@ -1150,12 +1226,18 @@ async def cb_menu_profile(update, ctx):
             f"Диагноз: {escape(str(p['diagnosis']))}\n"
             f"О себе: {escape(str(p['about']))}"
         )
-    await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_profile_view())
-    await q.answer()
+    try:
+        await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_profile_view())
+    except Exception:
+        try:
+            await q.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb_profile_view())
+        except Exception:
+            pass
 
 
 async def cb_profile_edit(update, ctx):
     q = update.callback_query
+    await q.answer()
     uid = q.from_user.id
     u = db_get_user(uid, q.from_user)
     if u["circle_file_id"]:
@@ -1172,40 +1254,49 @@ async def cb_profile_edit(update, ctx):
                 f"Диагноз: {p['diagnosis']}\n"
                 f"Описание о себе: {p['about']}"
             )
-        await q.message.edit_text(
-            "✏️ <b>Редактирование анкеты</b>\n\n"
-            "Текущая анкета:\n"
-            f"<code>{escape(current)}</code>\n\n"
-            "Отправьте новую анкету строго по шаблону:\n\n"
-            f"<code>{PROFILE_TEMPLATE}</code>\n\n"
-            f"📌 Лимит: <b>{limit_txt}</b>.\n"
-            "Все поля обязательны.\n"
-            "⚠️ Изменения применяются сразу, без модерации.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb_back("menu:main"),
-        )
+        try:
+            await q.message.edit_text(
+                "✏️ <b>Редактирование анкеты</b>\n\n"
+                "Текущая анкета:\n"
+                f"<code>{escape(current)}</code>\n\n"
+                "Отправьте новую анкету строго по шаблону:\n\n"
+                f"<code>{PROFILE_TEMPLATE}</code>\n\n"
+                f"📌 Лимит: <b>{limit_txt}</b>.\n"
+                "Все поля обязательны.\n"
+                "⚠️ Изменения применяются сразу, без модерации.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_back("menu:main"),
+            )
+        except Exception:
+            pass
     else:
         db_set(uid, circle_file_id=None)
         with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
             conn.execute("DELETE FROM profiles WHERE user_id=?", (uid,))
             conn.commit()
-        await q.message.edit_text("✏️ Анкета сброшена. Начинаем заново.", reply_markup=kb_back())
+        try:
+            await q.message.edit_text("✏️ Анкета сброшена. Начинаем заново.", reply_markup=kb_back())
+        except Exception:
+            pass
         await start_circle(q.message, ctx, uid)
-    await q.answer()
 
 
 async def cb_menu_shop(update, ctx):
     q = update.callback_query
-    await q.message.edit_text(
-        "🛒 <b>Магазин «Клёнчик»</b>\n\nВыберите товар:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb_shop(),
-    )
     await q.answer()
+    try:
+        await q.message.edit_text(
+            "🛒 <b>Магазин «Клёнчик»</b>\n\nВыберите товар:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_shop(),
+        )
+    except Exception:
+        pass
 
 
 async def cb_shop_item(update, ctx):
     q = update.callback_query
+    await q.answer()
     key = q.data.split(":")[1]
     if key == "vip1":
         price = db_get_price("vip1")
@@ -1242,12 +1333,15 @@ async def cb_shop_item(update, ctx):
         [InlineKeyboardButton("💳 Купить", callback_data=f"shop:buy:{key}")],
         [InlineKeyboardButton("◀️ Назад", callback_data="menu:shop")],
     ]
-    await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
-    await q.answer()
+    try:
+        await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+    except Exception:
+        pass
 
 
 async def cb_shop_buy(update, ctx):
     q = update.callback_query
+    await q.answer()
     key = q.data.split(":")[2]
     uid = q.from_user.id
     price = db_get_price(key)
@@ -1260,12 +1354,15 @@ async def cb_shop_buy(update, ctx):
         f"Пришлите ему ваш ID: <code>{uid}</code>\n\n"
         "После оплаты менеджер выдаст товар."
     )
-    await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_back("menu:shop"))
-    await q.answer()
+    try:
+        await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_back("menu:shop"))
+    except Exception:
+        pass
 
 
 async def cb_menu_anon(update, ctx):
     q = update.callback_query
+    await q.answer()
     uid = q.from_user.id
     left = anon_time_left(uid)
     if left <= 0:
@@ -1283,18 +1380,21 @@ async def cb_menu_anon(update, ctx):
             "🔎 Найти собеседника — подберём пару.\n"
             "🛑 Стоп — завершить диалог."
         )
-    await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_anon())
-    await q.answer()
+    try:
+        await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_anon())
+    except Exception:
+        pass
 
 
 async def cb_anon_find(update, ctx):
     q = update.callback_query
+    await q.answer()
     uid = q.from_user.id
     left = anon_time_left(uid)
     if left <= 0:
-        return await q.answer("Время вышло. Купите доступ.", show_alert=True)
+        return
     if get_partner(uid):
-        return await q.answer("Вы уже в чате.", show_alert=True)
+        return
 
     u = db_get_user(uid)
     if not u["anon_until"] and not u["anon_free_used"]:
@@ -1303,29 +1403,48 @@ async def cb_anon_find(update, ctx):
 
     with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
         row = conn.execute(
-            "SELECT user_id FROM anon_queue WHERE user_id != ? ORDER BY ts LIMIT 1", (uid,)
+            "SELECT user_id, msg_id FROM anon_queue WHERE user_id != ? ORDER BY ts LIMIT 1", (uid,)
         ).fetchone()
         if row:
-            partner = row[0]
+            partner, partner_msg_id = row[0], row[1]
             conn.execute("DELETE FROM anon_queue WHERE user_id IN (?,?)", (uid, partner))
             conn.execute("INSERT OR REPLACE INTO anon_pairs(user_a,user_b,ts) VALUES(?,?,?)",
                          (uid, partner, datetime.now(timezone.utc).isoformat()))
             conn.commit()
-            await safe_send(ctx.bot, partner, "🎉 Собеседник найден!")
-            await q.message.edit_text(
-                "🎉 <b>Собеседник найден!</b>\nОбщайтесь. Стоп — для завершения.",
-                parse_mode=ParseMode.HTML, reply_markup=kb_anon(),
-            )
+
+            if partner_msg_id:
+                try:
+                    await ctx.bot.edit_message_text(
+                        chat_id=partner, message_id=partner_msg_id,
+                        text="🎉 <b>Собеседник найден!</b>\nОбщайтесь. Стоп — для завершения.",
+                        parse_mode=ParseMode.HTML, reply_markup=kb_anon()
+                    )
+                except Exception:
+                    await safe_send(ctx.bot, partner, "🎉 <b>Собеседник найден!</b>\nОбщайтесь. Стоп — для завершения.", reply_markup=kb_anon())
+            else:
+                await safe_send(ctx.bot, partner, "🎉 <b>Собеседник найден!</b>\nОбщайтесь. Стоп — для завершения.", reply_markup=kb_anon())
+
+            try:
+                await q.message.edit_text(
+                    "🎉 <b>Собеседник найден!</b>\nОбщайтесь. Стоп — для завершения.",
+                    parse_mode=ParseMode.HTML, reply_markup=kb_anon(),
+                )
+            except Exception:
+                pass
         else:
-            conn.execute("INSERT OR REPLACE INTO anon_queue(user_id,ts) VALUES(?,?)",
-                         (uid, datetime.now(timezone.utc).isoformat()))
+            msg_id = q.message.message_id
+            conn.execute("INSERT OR REPLACE INTO anon_queue(user_id,ts,msg_id) VALUES(?,?,?)",
+                         (uid, datetime.now(timezone.utc).isoformat(), msg_id))
             conn.commit()
-            await q.message.edit_text("🔎 Ищем собеседника...", reply_markup=kb_anon())
-    await q.answer()
+            try:
+                await q.message.edit_text("🔎 Ищем собеседника...", reply_markup=kb_anon())
+            except Exception:
+                pass
 
 
 async def cb_anon_stop(update, ctx):
     q = update.callback_query
+    await q.answer()
     uid = q.from_user.id
     partner = get_partner(uid)
     with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
@@ -1336,21 +1455,26 @@ async def cb_anon_stop(update, ctx):
                 (uid, partner, partner, uid),
             )
         conn.commit()
-    await q.message.edit_text("🛑 Чат завершён.", reply_markup=kb_back())
+    try:
+        await q.message.edit_text("🛑 Чат завершён.", reply_markup=kb_back())
+    except Exception:
+        pass
     if partner:
-        await safe_send(ctx.bot, partner, "🛑 Собеседник завершил чат.")
-    await q.answer()
+        await safe_send(ctx.bot, partner, "🛑 Собеседник завершил чат.", reply_markup=kb_anon())
 
 
 async def cb_menu_support(update, ctx):
     q = update.callback_query
-    ctx.user_data["support_mode"] = True
-    await q.message.edit_text(
-        "🆘 <b>Поддержка</b>\n\nНапишите ваш вопрос одним сообщением.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb_back(),
-    )
     await q.answer()
+    ctx.user_data["support_mode"] = True
+    try:
+        await q.message.edit_text(
+            "🆘 <b>Поддержка</b>\n\nНапишите ваш вопрос одним сообщением.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_back(),
+        )
+    except Exception:
+        pass
 
 
 async def cb_app_accept(update, ctx):
@@ -1361,7 +1485,10 @@ async def cb_app_accept(update, ctx):
     with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
         conn.execute("UPDATE profiles SET approved=1, rejected=0 WHERE user_id=?", (uid,))
         conn.commit()
-    await q.message.edit_reply_markup(reply_markup=None)
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
     await safe_send(ctx.bot, uid, "✅ Ваша анкета одобрена! Теперь вам доступны все функции.")
     await safe_send(
         ctx.bot, uid,
@@ -1380,7 +1507,10 @@ async def cb_app_reject(update, ctx):
         conn.execute("UPDATE profiles SET approved=0, rejected=1 WHERE user_id=?", (uid,))
         conn.execute("UPDATE users SET banned=1, ban_reason='Анкета отклонена' WHERE user_id=?", (uid,))
         conn.commit()
-    await q.message.edit_reply_markup(reply_markup=None)
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
     await notify_user(ctx.bot, uid, PROFILE_REJECTED)
     await q.answer("Отклонено")
 
@@ -1396,7 +1526,10 @@ async def cb_app_rewrite(update, ctx):
         conn.commit()
     phrase = " · ".join(random.sample(CODE_WORDS, 3))
     db_set(uid, circle_phrase=phrase)
-    await q.message.edit_reply_markup(reply_markup=None)
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
     await safe_send(
         ctx.bot, uid,
         "✏️ Администратор попросил переписать анкету.\n\n"
@@ -1422,7 +1555,10 @@ async def cb_report_ban(update, ctx):
         return await q.answer("Нет прав", show_alert=True)
     uid = int(q.data.split(":")[2])
     db_set(uid, banned=1, ban_reason="Жалоба")
-    await q.message.edit_reply_markup(reply_markup=None)
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
     await safe_send(ctx.bot, uid, f"🚫 Забанены по жалобе.\nРазбан за {UNBAN_PRICE}₽ у {MANAGER}")
     await q.answer("Забанен")
 
@@ -1431,129 +1567,166 @@ async def cb_report_ignore(update, ctx):
     q = update.callback_query
     if not await is_admin(ctx.bot, q.from_user.id):
         return await q.answer("Нет прав", show_alert=True)
-    await q.message.edit_reply_markup(reply_markup=None)
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
     await q.answer("Игнорировано")
 
 
 async def cb_admin_main(update, ctx):
     q = update.callback_query
-    if q.from_user.id != ADMIN_ID:
-        return await q.answer("Нет доступа", show_alert=True)
-    await q.message.edit_text("🛠 <b>Админ-панель</b>", parse_mode=ParseMode.HTML, reply_markup=kb_admin())
     await q.answer()
+    if q.from_user.id != ADMIN_ID:
+        return
+    try:
+        await q.message.edit_text("🛠 <b>Админ-панель</b>", parse_mode=ParseMode.HTML, reply_markup=kb_admin())
+    except Exception:
+        pass
 
 
 async def cb_admin_count(update, ctx):
     q = update.callback_query
+    await q.answer()
     if q.from_user.id != ADMIN_ID:
-        return await q.answer("Нет доступа", show_alert=True)
+        return
     with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
         total = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         active = conn.execute("SELECT COUNT(*) FROM users WHERE banned=0").fetchone()[0]
         approved = conn.execute("SELECT COUNT(*) FROM profiles WHERE approved=1").fetchone()[0]
-    await q.message.edit_text(
-        f"👥 Всего: <b>{total}</b>\nАктивных: <b>{active}</b>\nАнкет одобрено: <b>{approved}</b>",
-        parse_mode=ParseMode.HTML, reply_markup=kb_back("admin:main"),
-    )
-    await q.answer()
+    try:
+        await q.message.edit_text(
+            f"👥 Всего: <b>{total}</b>\nАктивных: <b>{active}</b>\nАнкет одобрено: <b>{approved}</b>",
+            parse_mode=ParseMode.HTML, reply_markup=kb_back("admin:main"),
+        )
+    except Exception:
+        pass
 
 
 async def cb_admin_ban(update, ctx):
     q = update.callback_query
-    if q.from_user.id != ADMIN_ID:
-        return await q.answer("Нет доступа", show_alert=True)
-    ctx.user_data["admin_input"] = ("ban",)
-    await q.message.edit_text("Введите ID для бана:", reply_markup=kb_back("admin:main"))
     await q.answer()
+    if q.from_user.id != ADMIN_ID:
+        return
+    ctx.user_data["admin_input"] = ("ban",)
+    try:
+        await q.message.edit_text("Введите ID для бана:", reply_markup=kb_back("admin:main"))
+    except Exception:
+        pass
 
 
 async def cb_admin_unban(update, ctx):
     q = update.callback_query
-    if q.from_user.id != ADMIN_ID:
-        return await q.answer("Нет доступа", show_alert=True)
-    ctx.user_data["admin_input"] = ("unban",)
-    await q.message.edit_text("Введите ID для разбана:", reply_markup=kb_back("admin:main"))
     await q.answer()
+    if q.from_user.id != ADMIN_ID:
+        return
+    ctx.user_data["admin_input"] = ("unban",)
+    try:
+        await q.message.edit_text("Введите ID для разбана:", reply_markup=kb_back("admin:main"))
+    except Exception:
+        pass
 
 
 async def cb_admin_give_vip(update, ctx):
     q = update.callback_query
-    if q.from_user.id != ADMIN_ID:
-        return await q.answer("Нет доступа", show_alert=True)
-    ctx.user_data["admin_input"] = ("give_vip_uid",)
-    await q.message.edit_text("Введите ID пользователя:", reply_markup=kb_back("admin:main"))
     await q.answer()
+    if q.from_user.id != ADMIN_ID:
+        return
+    ctx.user_data["admin_input"] = ("give_vip_uid",)
+    try:
+        await q.message.edit_text("Введите ID пользователя:", reply_markup=kb_back("admin:main"))
+    except Exception:
+        pass
 
 
 async def cb_admin_vip_lvl(update, ctx):
     q = update.callback_query
+    await q.answer()
     if q.from_user.id != ADMIN_ID:
-        return await q.answer("Нет доступа", show_alert=True)
+        return
     parts = q.data.split(":")
     uid, lvl = int(parts[2]), int(parts[3])
     ctx.user_data.pop("admin_pending_vip_uid", None)
     ctx.user_data["admin_input"] = ("give_vip_days", uid, lvl)
-    await q.message.edit_text(
-        f"Введите число дней для VIP {lvl} (0 = навсегда):",
-        reply_markup=kb_back("admin:main"),
-    )
-    await q.answer()
+    try:
+        await q.message.edit_text(
+            f"Введите число дней для VIP {lvl} (0 = навсегда):",
+            reply_markup=kb_back("admin:main"),
+        )
+    except Exception:
+        pass
 
 
 async def cb_admin_take_vip(update, ctx):
     q = update.callback_query
-    if q.from_user.id != ADMIN_ID:
-        return await q.answer("Нет доступа", show_alert=True)
-    ctx.user_data["admin_input"] = ("take_vip",)
-    await q.message.edit_text("Введите ID, чтобы снять VIP:", reply_markup=kb_back("admin:main"))
     await q.answer()
+    if q.from_user.id != ADMIN_ID:
+        return
+    ctx.user_data["admin_input"] = ("take_vip",)
+    try:
+        await q.message.edit_text("Введите ID, чтобы снять VIP:", reply_markup=kb_back("admin:main"))
+    except Exception:
+        pass
 
 
 async def cb_admin_give_anon(update, ctx):
     q = update.callback_query
-    if q.from_user.id != ADMIN_ID:
-        return await q.answer("Нет доступа", show_alert=True)
-    ctx.user_data["admin_input"] = ("give_anon",)
-    await q.message.edit_text(
-        "Введите: <code>ID дни</code> (0 = навсегда).\nПример: <code>123456789 30</code>",
-        parse_mode=ParseMode.HTML, reply_markup=kb_back("admin:main"),
-    )
     await q.answer()
+    if q.from_user.id != ADMIN_ID:
+        return
+    ctx.user_data["admin_input"] = ("give_anon",)
+    try:
+        await q.message.edit_text(
+            "Введите: <code>ID дни</code> (0 = навсегда).\nПример: <code>123456789 30</code>",
+            parse_mode=ParseMode.HTML, reply_markup=kb_back("admin:main"),
+        )
+    except Exception:
+        pass
 
 
 async def cb_admin_take_anon(update, ctx):
     q = update.callback_query
-    if q.from_user.id != ADMIN_ID:
-        return await q.answer("Нет доступа", show_alert=True)
-    ctx.user_data["admin_input"] = ("take_anon",)
-    await q.message.edit_text("Введите ID, чтобы снять анон:", reply_markup=kb_back("admin:main"))
     await q.answer()
+    if q.from_user.id != ADMIN_ID:
+        return
+    ctx.user_data["admin_input"] = ("take_anon",)
+    try:
+        await q.message.edit_text("Введите ID, чтобы снять анон:", reply_markup=kb_back("admin:main"))
+    except Exception:
+        pass
 
 
 async def cb_admin_prices(update, ctx):
     q = update.callback_query
-    if q.from_user.id != ADMIN_ID:
-        return await q.answer("Нет доступа", show_alert=True)
-    await q.message.edit_text("💲 <b>Цены:</b>", parse_mode=ParseMode.HTML,
-                              reply_markup=kb_admin_prices())
     await q.answer()
+    if q.from_user.id != ADMIN_ID:
+        return
+    try:
+        await q.message.edit_text("💲 <b>Цены:</b>", parse_mode=ParseMode.HTML,
+                                  reply_markup=kb_admin_prices())
+    except Exception:
+        pass
 
 
 async def cb_admin_price_set(update, ctx):
     q = update.callback_query
+    await q.answer()
     if q.from_user.id != ADMIN_ID:
-        return await q.answer("Нет доступа", show_alert=True)
+        return
     key = q.data.split(":")[2]
     ctx.user_data["admin_input"] = ("price", key)
-    await q.message.edit_text(f"Новая цена для <b>{key}</b>:", parse_mode=ParseMode.HTML,
-                              reply_markup=kb_back("admin:prices"))
-    await q.answer()
+    try:
+        await q.message.edit_text(f"Новая цена для <b>{key}</b>:", parse_mode=ParseMode.HTML,
+                                  reply_markup=kb_back("admin:prices"))
+    except Exception:
+        pass
 
 
 async def cb_admin_users(update, ctx):
     q = update.callback_query
+    await q.answer()
     if q.from_user.id != ADMIN_ID:
-        return await q.answer("Нет доступа", show_alert=True)
+        return
     with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -1568,12 +1741,14 @@ async def cb_admin_users(update, ctx):
         else:
             who = escape(str(r["full_name"])) if r["full_name"] else "без имени"
         lines.append(f"{st} <code>{r['user_id']}</code> · {who} · VIP{r['vip']}")
-    await q.message.edit_text(
-        "\n".join(lines),
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb_back("admin:main"),
-    )
-    await q.answer()
+    try:
+        await q.message.edit_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_back("admin:main"),
+        )
+    except Exception:
+        pass
 
 
 async def cb_noop(update, ctx):
