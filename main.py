@@ -1,1173 +1,1446 @@
-import subprocess
-import sys
-
-def _ensure(pkg_spec: str, import_name: str) -> None:
-    try:
-        __import__(import_name)
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg_spec])
-
-_ensure("python-telegram-bot>=20,<22", "telegram")
-_ensure("python-dotenv", "dotenv")
-
+import asyncio
 import os
-import re
 import random
 import sqlite3
-import asyncio
-import logging
-import html
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from pathlib import Path
 
 from dotenv import load_dotenv
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
 )
 from telegram.constants import ParseMode
-from telegram.error import NetworkError, TimedOut, RetryAfter, Forbidden, BadRequest
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters
+    Application, ApplicationHandlerStop, CallbackQueryHandler,
+    MessageHandler, filters, ContextTypes,
 )
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
-SUPERADMIN_ID = int(os.getenv("SUPERADMIN_ID", "0"))
-PAYMENT_LINK = os.getenv("PAYMENT_LINK", "")
+BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN не задан в .env")
 
-DATA_DIR = os.getenv("DATA_DIR", "")
-DB_PATH = os.getenv("DB_PATH", "data.db")
+ADMIN_ID = int((os.getenv("ADMIN_ID") or "0").strip() or "0")
+ADMIN_CHAT_ID = int((os.getenv("ADMIN_CHAT_ID") or "0").strip() or "0")
+TOPIC_APPS = int((os.getenv("TOPIC_APPLICATIONS") or "0").strip() or "0")
+TOPIC_TICKETS = int((os.getenv("TOPIC_TICKETS") or "0").strip() or "0")
+TOPIC_REPORTS = int((os.getenv("TOPIC_REPORTS") or "0").strip() or "0")
+TOPIC_SYSTEM = int((os.getenv("TOPIC_SYSTEM") or "0").strip() or "0")
+MANAGER = (os.getenv("MANAGER_USERNAME") or "@manager").strip()
+UNBAN_PRICE = int((os.getenv("UNBAN_PRICE") or "500").strip() or "500")
+ANON_PRICE = int((os.getenv("ANON_PRICE") or "30").strip() or "30")
+ANON_FREE_MIN = int((os.getenv("ANON_FREE_MIN") or "60").strip() or "60")
+ANON_PAID_DAYS = int((os.getenv("ANON_PAID_DAYS") or "1").strip() or "1")
 
-if DATA_DIR and not os.path.isabs(DB_PATH):
-    DB_PATH = os.path.join(DATA_DIR, DB_PATH)
+DATA_DIR = Path((os.getenv("DATA_DIR") or ".").strip()) / "app" / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = str(DATA_DIR / "klencik.db")
 
-os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+CODE_WORDS = ["клён", "листопад", "янтарь", "осень", "ветер", "огонь", "река",
+              "туман", "рассвет", "пепел", "север", "ирис", "кобальт", "стрела", "гром"]
 
-PRICES = {
-    "vip_low": (300, "🟢 VIP Низкий"),
-    "vip_mid": (500, "🟡 VIP Средний"),
-    "vip_high": (700, "🔴 VIP Высокий"),
-    "chars_600": (40, "📝 Символы до 600"),
-    "unlimited_likes": (200, "❤️ Безлимит лайков (1 день)"),
-    "prev_anketa": (80, "⏪ Возврат анкеты"),
-    "second_media": (60, "📸 Второе фото/видео"),
-    "incognito_day": (30, "🕵️ Чат инкогнито (1 день)"),
-}
+PROFILE_TEMPLATE = "Имя: \nВозраст: \nГород: \nДиагноз: \nОписание о себе: "
 
-VIP_LIMITS = {
-    0: {"likes": 20, "chars": 300, "photos": 1, "video": False, "priority": 0, "prev": False},
-    1: {"likes": 40, "chars": 600, "photos": 1, "video": False, "priority": 1, "prev": False},
-    2: {"likes": 60, "chars": 800, "photos": 2, "video": False, "priority": 2, "prev": False},
-    3: {"likes": 999999, "chars": 1000, "photos": 2, "video": True, "priority": 3, "prev": True},
-}
 
-VERIFY_WORDS = ["КЛЕН", "ЛИСТ", "БУКЕТ", "ОСЕНЬ", "ВЕТЕР", "ЗАКАТ"]
+def _tk(topic):
+    return {"message_thread_id": topic} if topic > 0 else {}
 
-STATUS_RU = {
-    "new": "🥚 Новичок",
-    "awaiting_contact": "📱 Ждёт номер",
-    "awaiting_video": "🎥 Ждёт видео",
-    "awaiting_form": "📝 Заполняет анкету",
-    "pending_review": "⏳ На модерации",
-    "active": "✅ Активен",
-    "banned": "🚫 Забанен",
-    "rejected": "❌ Отклонён",
-}
 
-def get_status_ru(status: str) -> str:
-    return STATUS_RU.get(status, status)
-
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-    level=logging.INFO
-)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-log = logging.getLogger("klenchik")
-
-WAITING_USERS = set()
-ACTIVE_CHATS = {}
-
-def get_payment_contact() -> str:
-    pl = (PAYMENT_LINK or "").strip()
-    if not pl:
-        return "@admin"
-    for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
-        if pl.startswith(prefix):
-            username = pl[len(prefix):].split("/")[0].split("?")[0]
-            return "@" + username
-    if not pl.startswith("@"):
-        return "@" + pl
-    return pl
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS users(
- tg_id INTEGER PRIMARY KEY, username TEXT, phone TEXT,
- status TEXT DEFAULT 'new', banned INTEGER DEFAULT 0, ban_reason TEXT,
- vip_level INTEGER DEFAULT 0, vip_until TEXT,
- incognito_until TEXT,
- likes_left INTEGER DEFAULT 20, likes_reset_at TEXT,
- photos_used INTEGER DEFAULT 0, video_used INTEGER DEFAULT 0,
- chars_limit INTEGER DEFAULT 300, prev_anketa_id INTEGER,
- attempts_left INTEGER DEFAULT 3, verify_words TEXT, has_prev_addon INTEGER DEFAULT 0,
- pending_action TEXT, created_at TEXT
-);
-CREATE TABLE IF NOT EXISTS profiles(
- id INTEGER PRIMARY KEY AUTOINCREMENT, tg_id INTEGER UNIQUE,
- name TEXT, age INTEGER, pronouns TEXT, city TEXT, diagnosis TEXT,
- reason TEXT, hobby TEXT, photo1 TEXT, photo2 TEXT, video TEXT,
- approved INTEGER DEFAULT 0, created_at TEXT
-);
-CREATE TABLE IF NOT EXISTS likes(from_tg INTEGER, to_tg INTEGER, created_at TEXT);
-CREATE TABLE IF NOT EXISTS reports(id INTEGER PRIMARY KEY AUTOINCREMENT, reporter INTEGER, target INTEGER, reason TEXT, created_at TEXT);
-CREATE TABLE IF NOT EXISTS admin_states(tg_id INTEGER PRIMARY KEY, action TEXT, target_id INTEGER, payload TEXT);
-CREATE TABLE IF NOT EXISTS support_tickets(admin_msg_id INTEGER PRIMARY KEY, user_id INTEGER, created_at TEXT);
-"""
-
-def _sync_exec(query: str, params: tuple = (), fetch: Optional[str] = None):
-    conn = sqlite3.connect(DB_PATH, timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    try:
-        cur = conn.cursor()
-        cur.execute(query, params)
-        if fetch == "one":
-            return cur.fetchone()
-        if fetch == "all":
-            return cur.fetchall()
+def _init_db():
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            full_name TEXT,
+            phone TEXT,
+            agreed INTEGER DEFAULT 0,
+            banned INTEGER DEFAULT 0,
+            ban_reason TEXT,
+            circle_file_id TEXT,
+            circle_phrase TEXT,
+            vip INTEGER DEFAULT 0,
+            vip_until TEXT,
+            likes_left INTEGER DEFAULT 20,
+            likes_date TEXT,
+            anon_until TEXT,
+            anon_free_date TEXT,
+            anon_free_used INTEGER DEFAULT 0,
+            created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS profiles (
+            user_id INTEGER PRIMARY KEY,
+            name TEXT, age TEXT, city TEXT, diagnosis TEXT, about TEXT,
+            approved INTEGER DEFAULT 0, rejected INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS likes (
+            from_id INTEGER, to_id INTEGER, ts TEXT,
+            PRIMARY KEY (from_id, to_id)
+        );
+        CREATE TABLE IF NOT EXISTS anon_queue (
+            user_id INTEGER PRIMARY KEY, ts TEXT
+        );
+        CREATE TABLE IF NOT EXISTS anon_pairs (
+            user_a INTEGER, user_b INTEGER, ts TEXT,
+            PRIMARY KEY (user_a, user_b)
+        );
+        CREATE TABLE IF NOT EXISTS prices (key TEXT PRIMARY KEY, val INTEGER);
+        CREATE TABLE IF NOT EXISTS admin_msgs (msg_id INTEGER PRIMARY KEY, user_id INTEGER, mtype TEXT);
+        """)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "full_name" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN full_name TEXT")
+        for k, v in {
+            "vip1": int(os.getenv("VIP1_PRICE") or 200),
+            "vip2": int(os.getenv("VIP2_PRICE") or 350),
+            "vip3": int(os.getenv("VIP3_PRICE") or 550),
+            "anon": ANON_PRICE,
+            "unban": UNBAN_PRICE,
+        }.items():
+            conn.execute("INSERT OR IGNORE INTO prices(key,val) VALUES(?,?)", (k, v))
         conn.commit()
-        return cur.lastrowid
-    finally:
-        conn.close()
 
-async def db_exec(query: str, params: tuple = (), fetch: Optional[str] = None):
-    return await asyncio.to_thread(_sync_exec, query, params, fetch)
 
-def now_iso():
-    return datetime.utcnow().isoformat()
+_init_db()
 
-async def db_init():
-    conn = sqlite3.connect(DB_PATH)
-    conn.executescript(SCHEMA)
-    try: conn.execute("ALTER TABLE users ADD COLUMN verify_words TEXT")
-    except: pass
-    try: conn.execute("ALTER TABLE users ADD COLUMN has_prev_addon INTEGER DEFAULT 0")
-    except: pass
-    try: conn.execute("ALTER TABLE users ADD COLUMN pending_action TEXT")
-    except: pass
-    try: conn.execute("ALTER TABLE users ADD COLUMN incognito_until TEXT")
-    except: pass
-    conn.commit()
-    conn.close()
 
-async def get_user(tg_id: int):
-    return await db_exec("SELECT * FROM users WHERE tg_id=?", (tg_id,), fetch="one")
-
-async def upsert_user(tg_id: int, **kw):
-    u = await get_user(tg_id)
-    if not u:
-        await db_exec(
-            "INSERT INTO users(tg_id, status, likes_left, likes_reset_at, chars_limit, attempts_left, created_at) VALUES(?,?,?,?,?,?,?)",
-            (tg_id, "new", 20, now_iso(), 300, 3, now_iso())
-        )
-        u = await get_user(tg_id)
-    if kw:
-        sets = ", ".join(f"{k}=?" for k in kw)
-        await db_exec(f"UPDATE users SET {sets} WHERE tg_id=?", (*kw.values(), tg_id))
-        u = await get_user(tg_id)
-    return u
-
-async def vip_limits(u):
-    lvl = u["vip_level"] or 0
-    if u["vip_until"]:
-        try:
-            if datetime.fromisoformat(u["vip_until"]) < datetime.utcnow():
-                lvl = 0
-                await upsert_user(u["tg_id"], vip_level=0, vip_until=None)
-        except: pass
-    return VIP_LIMITS.get(lvl, VIP_LIMITS[0])
-
-async def refresh_likes(tg_id: int):
-    u = await get_user(tg_id)
-    if not u: return
-    lim = await vip_limits(u)
-    reset = u["likes_reset_at"]
-    if not reset or datetime.fromisoformat(reset) < datetime.utcnow() - timedelta(days=1):
-        await upsert_user(tg_id, likes_left=lim["likes"], likes_reset_at=now_iso())
-
-async def safe(func, *args, **kwargs):
-    try:
-        return await func(*args, **kwargs)
-    except RetryAfter as e:
-        await asyncio.sleep(e.retry_after + 1)
-        return await safe(func, *args, **kwargs)
-    except (TimedOut, NetworkError):
-        return None
-    except (Forbidden, BadRequest) as e:
-        log.warning(f"TG API Error: {e}")
-        return None
-    except Exception as e:
-        log.error(f"Unexpected error: {e}")
-        return None
-
-def esc(text) -> str:
-    return html.escape(str(text), quote=False) if text else ""
-
-def main_menu_kb(user_id: int = 0):
-    kb_list = [
-        [InlineKeyboardButton("🗂 Смотреть анкеты", callback_data="menu:ankety")],
-        [InlineKeyboardButton("💬 Чат инкогнито", callback_data="menu:incognito")],
-        [InlineKeyboardButton("🛒 Магазин", callback_data="menu:shop")],
-        [InlineKeyboardButton("🆘 Поддержка", callback_data="menu:support")],
-        [InlineKeyboardButton("👤 Моя анкета", callback_data="menu:profile")],
-    ]
-    if user_id == SUPERADMIN_ID:
-        kb_list.append([InlineKeyboardButton("🛠 Админ-панель", callback_data="a:main")])
-    return InlineKeyboardMarkup(kb_list)
-
-def incognito_menu_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔍 Искать собеседника", callback_data="incog:search")],
-        [InlineKeyboardButton("⬅️ В меню", callback_data="menu:back")]
-    ])
-
-def incog_active_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛑 Остановить чат", callback_data="incog:stop")]
-    ])
-
-async def send_main_menu(bot, chat_id):
-    text = (
-        "🍁 <b>Главное меню Кленчика</b>\n\n"
-        "Выбери, что хочешь сделать:\n\n"
-        "🗂 <b>Смотреть анкеты</b> — листай анкеты других пользователей и ставь лайки\n"
-        "💬 <b>Чат инкогнито</b> — анонимное общение со случайным человеком\n"
-        "🛒 <b>Магазин</b> — VIP-статусы и дополнения для анкеты\n"
-        "🆘 <b>Поддержка</b> — напиши нам, если что-то не работает\n"
-        "👤 <b>Моя анкета</b> — посмотреть свою анкету и VIP-статус"
-    )
-    await safe(bot.send_message, chat_id=chat_id, text=text, reply_markup=main_menu_kb(chat_id), parse_mode=ParseMode.HTML)
-
-def admin_main_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👥 Пользователи", callback_data="a:users:0")],
-        [InlineKeyboardButton("📝 На модерации", callback_data="a:pending")],
-        [InlineKeyboardButton("⚙️ Выдать по ID", callback_data="a:givebyid")],
-        [InlineKeyboardButton("🗑 Забрать по ID", callback_data="a:takebyid")],
-        [InlineKeyboardButton("🚫 Баны", callback_data="a:bans")],
-        [InlineKeyboardButton("📊 Статистика", callback_data="a:stats")],
-        [InlineKeyboardButton("⬅️ В главное меню", callback_data="menu:back")]
-    ])
-
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user: return
-
-    if user.id in ACTIVE_CHATS:
-        partner = ACTIVE_CHATS.pop(user.id, None)
-        if partner:
-            ACTIVE_CHATS.pop(partner, None)
-            await safe(ctx.bot.send_message, partner, "🛑 Собеседник покинул чат. Ты можешь найти нового.", reply_markup=incognito_menu_kb())
-        WAITING_USERS.discard(user.id)
-
-    await db_exec("DELETE FROM admin_states WHERE tg_id=?", (user.id,))
-    await db_exec("UPDATE users SET pending_action=NULL WHERE tg_id=?", (user.id,))
-
-    u = await upsert_user(user.id, username=user.username or "")
-
-    if u["banned"]:
-        return await update.message.reply_text(f"🚫 <b>Доступ к боту заблокирован.</b>\n\nПричина: {u['ban_reason'] or 'не указана'}\n\nЕсли считаешь это ошибкой — напиши администратору.", parse_mode=ParseMode.HTML)
-
-    if u["status"] == "active":
-        return await send_main_menu(ctx.bot, user.id)
-
-    if u["status"] == "pending_review":
-        return await update.message.reply_text(
-            "⏳ <b>Анкета на модерации</b> 🍁\n\n"
-            "Твоя анкета уже у модератора. Обычно проверка занимает немного времени.\n\n"
-            "<i>Мы напишем тебе, как только примем решение. Просто подожди немного.</i>",
-            parse_mode=ParseMode.HTML
-        )
-
-    if u["status"] == "new":
-        await upsert_user(user.id, status="awaiting_contact")
-        kb = ReplyKeyboardMarkup([[KeyboardButton("📱 Поделиться номером", request_contact=True)]], resize_keyboard=True, one_time_keyboard=True)
-        return await update.message.reply_text(
-            "🍁 <b>Добро пожаловать в Кленчик!</b> 🍁\n\n"
-            "Здесь ты можешь найти друзей, пообщаться в анонимном чате и просто провести время в уютной осенней атмосфере.\n\n"
-            "📋 <b>Шаг 1 из 3: Знакомство</b>\n"
-            "Пожалуйста, поделись своим номером телефона — нажми на кнопку ниже.\n\n"
-            "🔒 <i>Твой номер останется внутри бота и никуда не передаётся. Он нужен только для защиты от мультиаккаунтов и проверки возраста.</i>",
-            reply_markup=kb, parse_mode=ParseMode.HTML
-        )
-
-    if u["status"] == "awaiting_contact":
-        kb = ReplyKeyboardMarkup([[KeyboardButton("📱 Поделиться номером", request_contact=True)]], resize_keyboard=True, one_time_keyboard=True)
-        return await update.message.reply_text("🍁 Пожалуйста, поделись номером с помощью кнопки ниже.", reply_markup=kb)
-
-    if u["status"] == "awaiting_video":
-        words = u["verify_words"] or "—"
-        return await update.message.reply_text(
-            "🎥 <b>Шаг 2 из 3: Видео-кружок</b> 🍁\n\n"
-            "Чтобы убедиться, что ты реальный человек, запиши <b>видео-кружок</b> (нажми на скрепку 📎 → «Видео-кружок»).\n\n"
-            f"🎥 В кружке нужно чётко произнести вслух: <b>{words}</b>\n\n"
-            "⚠️ <i>У тебя 3 попытки. Если пришлёшь не кружок — попытка сгорит. После 3 промахов бот заблокирует доступ.</i>",
-            reply_markup=ReplyKeyboardRemove(), parse_mode=ParseMode.HTML
-        )
-
-    if u["status"] == "awaiting_form":
-        lim = await vip_limits(u)
-        chars = max(u["chars_limit"] or 300, lim["chars"])
-        template = (
-            "<code>1. Имя/Псевдоним:\n2. Возраст:\n3. Местоимения:\n"
-            "4. Город:\n5. Диагноз:\n6. Зачем пришёл/ла:\n7. Хобби:</code>"
-        )
-        return await update.message.reply_text(
-            f"📝 <b>Шаг 3 из 3: Анкета</b> 🍁\n\n"
-            "Отлично, видео принято! Остался последний шаг — заполни анкету о себе.\n\n"
-            "Скопируй шаблон ниже (тапни по нему), заполни все поля и отправь <b>одним сообщением</b>:\n\n"
-            f"{template}\n\n"
-            f"⚠️ <b>Лимит символов:</b> {chars}\n"
-            "📸 Можешь прикрепить одно фото к сообщению — анкеты с фото получают больше лайков!\n"
-            "🔞 Возраст от 12 лет.",
-            parse_mode=ParseMode.HTML, reply_markup=ReplyKeyboardRemove()
-        )
-
-async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    
-    if user_id in WAITING_USERS:
-        WAITING_USERS.remove(user_id)
-        return await update.message.reply_text("🛑 Поиск собеседника отменён.", reply_markup=incognito_menu_kb())
-        
-    if user_id in ACTIVE_CHATS:
-        partner_id = ACTIVE_CHATS.pop(user_id)
-        ACTIVE_CHATS.pop(partner_id, None)
-        
-        await update.message.reply_text("🛑 Ты покинул анонимный чат.", reply_markup=incognito_menu_kb())
-        await safe(ctx.bot.send_message, partner_id, "🛑 Собеседник покинул чат. Ты можешь найти нового.", reply_markup=incognito_menu_kb())
-        return
-
-    await update.message.reply_text("Вы сейчас не в чате и не в поиске.")
-
-async def on_contact(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not msg or not msg.contact: return
-    if msg.contact.user_id != msg.from_user.id:
-        return await msg.reply_text("🍁 Пожалуйста, используй кнопку ниже.")
-
-    words = random.sample(VERIFY_WORDS, 3)
-    words_str = ", ".join(words)
-
-    await upsert_user(msg.from_user.id, phone=msg.contact.phone_number, status="awaiting_video", verify_words=words_str, attempts_left=3)
-
-    await msg.reply_text(
-        "✅ Спасибо! Номер принят. 🍁\n\n"
-        "🎥 <b>Шаг 2 из 3: Подтверждение личности</b>\n\n"
-        "Запиши <b>видео-кружок</b> (нажми на скрепку 📎 → «Видео-кружок»).\n\n"
-        "🎥 В кружке должно быть:\n"
-        "• Лицо чётко видно, без размытия и бликов\n"
-        f"• Ты произносишь вслух: <b>{words_str}</b>\n\n"
-        "⚠️ <i>У тебя 3 попытки. Если пришлёшь не кружок — попытка сгорит.</i>",
-        parse_mode=ParseMode.HTML, reply_markup=ReplyKeyboardRemove()
-    )
-
-async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not msg or not msg.video_note: return
-    user_id = msg.from_user.id
-    
-    if user_id in ACTIVE_CHATS:
-        partner = ACTIVE_CHATS[user_id]
-        await safe(ctx.bot.copy_message, chat_id=partner, from_chat_id=user_id, message_id=msg.message_id)
-        return
-
-    u = await get_user(user_id)
-    if not u: return
-    if u["banned"]: return
-
-    if u["status"] == "awaiting_video":
-        await upsert_user(user_id, status="awaiting_form")
-
-        await safe(
-            db_exec,
-            "INSERT OR IGNORE INTO profiles(tg_id, video, approved, created_at) VALUES(?,?,0,?)",
-            (user_id, msg.video_note.file_id, now_iso())
-        )
-
-        lim = await vip_limits(u)
-        chars = max(u["chars_limit"] or 300, lim["chars"])
-        template = (
-            "<code>1. Имя/Псевдоним:\n2. Возраст:\n3. Местоимения:\n"
-            "4. Город:\n5. Диагноз:\n6. Зачем пришёл/ла:\n7. Хобби:</code>"
-        )
-
-        await msg.reply_text("✅ Видео принято! 🍁")
-        return await msg.reply_text(
-            f"📝 <b>Шаг 3 из 3: Анкета</b> 🍁\n\n"
-            "Отлично, остался последний шаг — заполни анкету о себе.\n\n"
-            "Скопируй шаблон ниже (тапни по нему), заполни все поля и отправь <b>одним сообщением</b>:\n\n"
-            f"{template}\n\n"
-            f"⚠️ <b>Лимит символов:</b> {chars}\n"
-            "📸 Можешь прикрепить одно фото к сообщению — анкеты с фото получают больше лайков!\n"
-            "🔞 Возраст от 12 лет.",
-            parse_mode=ParseMode.HTML
-        )
-        
-    if u["status"] == "active":
-        await send_main_menu(ctx.bot, user_id)
-
-def parse_form(text: str):
-    lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
-    if len(lines) != 7: return None
-    out = {}
-    keys = ["name", "age", "pronouns", "city", "diagnosis", "reason", "hobby"]
-    field_names = ["Имя/Псевдоним", "Возраст", "Местоимения", "Город", "Диагноз", "Зачем пришёл/ла", "Хобби"]
-
-    for i, key in enumerate(keys):
-        line = lines[i]
-        if not line.startswith(f"{i+1}."): return None
-        val = line.split(".", 1)[1].strip()
-        if val.startswith(field_names[i]):
-            val = val[len(field_names[i]):].strip()
-        val = val.lstrip(":").strip()
-        if not val: return None
-        out[key] = val
-
-    try:
-        age_str = re.sub(r'\D', '', out["age"])
-        age = int(age_str)
-    except: return None
-    if not (12 <= age <= 99): return None
-    out["age"] = age
-    return out
-
-async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not msg or not msg.text: return
-    user_id = msg.from_user.id
-    text = msg.text
-
-    if user_id in ACTIVE_CHATS:
-        partner = ACTIVE_CHATS[user_id]
-        await safe(ctx.bot.copy_message, chat_id=partner, from_chat_id=user_id, message_id=msg.message_id)
-        return
-
-    admin_state = await db_exec("SELECT * FROM admin_states WHERE tg_id=?", (user_id,), fetch="one")
-    if admin_state:
-        await handle_admin_input(msg, ctx, admin_state)
-        return
-
-    u = await get_user(user_id)
-    if not u: return
-    if u["banned"]: return
-
-    if u["pending_action"] == "support":
-        await db_exec("UPDATE users SET pending_action=NULL WHERE tg_id=?", (user_id,))
-        
-        sent_msg = await safe(
-            ctx.bot.send_message,
-            ADMIN_CHAT_ID,
-            f"🆘 <b>Обращение в поддержку</b>\n\n"
-            f"👤 @{esc(u['username']) if u['username'] else 'без username'}\n"
-            f"🆔 <code>{user_id}</code>\n\n"
-            f"💬 <b>Сообщение:</b>\n{esc(text)}\n\n"
-            f"<i>Чтобы ответить, зажми это сообщение и выбери «Ответить».</i>",
-            parse_mode=ParseMode.HTML
-        )
-        
-        if sent_msg:
-            await db_exec("INSERT INTO support_tickets(admin_msg_id, user_id, created_at) VALUES(?,?,?)", (sent_msg.message_id, user_id, now_iso()))
-            
-        return await msg.reply_text("✅ Обращение отправлено! 🍁\n\n<i>Администратор ответит тебе прямо здесь, как только освободится.</i>", parse_mode=ParseMode.HTML)
-
-    if u["status"] == "awaiting_video":
-        left = (u["attempts_left"] or 1) - 1
-        if left <= 0:
-            await upsert_user(user_id, banned=1, ban_reason="Не прошёл верификацию", status="banned")
-            return await msg.reply_text("🚫 Вы исчерпали попытки. Доступ заблокирован.")
-        await upsert_user(user_id, attempts_left=left)
-        return await msg.reply_text(f"❌ Ты прислал не видео-кружок. Осталось попыток: <b>{left}</b>. После этого доступ будет заблокирован.", parse_mode=ParseMode.HTML)
-
-    if u["status"] == "awaiting_form":
-        data = parse_form(text)
-        if not data:
-            return await msg.reply_text(
-                "❌ <b>Анкета заполнена не по форме.</b>\n\n"
-                "Скопируй шаблон ниже, заполни все поля и отправь <b>одним сообщением</b>:\n\n"
-                "<code>1. Имя/Псевдоним:\n2. Возраст:\n3. Местоимения:\n4. Город:\n5. Диагноз:\n6. Зачем пришёл/ла:\n7. Хобби:</code>",
-                parse_mode=ParseMode.HTML
-            )
-
-        lim = await vip_limits(u)
-        chars_limit = max(u["chars_limit"] or 300, lim["chars"])
-        for k in ["reason", "hobby", "diagnosis"]:
-            if len(data[k]) > chars_limit:
-                return await msg.reply_text(f"❌ Поле «{k}» превышает лимит {chars_limit} символов. Сократи, пожалуйста.")
-
-        photo1 = msg.photo[-1].file_id if msg.photo else None
-
-        await db_exec(
-            "UPDATE profiles SET name=?, age=?, pronouns=?, city=?, diagnosis=?, reason=?, hobby=?, photo1=COALESCE(?,photo1), approved=0 WHERE tg_id=?",
-            (data["name"], data["age"], data["pronouns"], data["city"], data["diagnosis"], data["reason"], data["hobby"], photo1, user_id)
-        )
-        prof = await db_exec("SELECT * FROM profiles WHERE tg_id=?", (user_id,), fetch="one")
-
-        await upsert_user(user_id, status="pending_review")
-        await msg.reply_text(
-            "📨 <b>Анкета отправлена на модерацию!</b> 🍁\n\n"
-            "Спасибо за регистрацию! Твоя анкета сейчас на проверке у модератора.\n\n"
-            "🕒 <i>Обычно это занимает немного времени. Мы напишем тебе, как только примем решение — жди сообщение от бота.</i>\n\n"
-            "Пока можешь отдохнуть. Скоро увидимся! 🍁",
-            parse_mode=ParseMode.HTML
-        )
-        await send_to_admin_chat(ctx.bot, prof, u)
-        return
-        
-    if u["status"] == "active":
-        await send_main_menu(ctx.bot, user_id)
-    elif u["status"] == "pending_review":
-        await msg.reply_text("⏳ Твоя анкета всё ещё на модерации. Пожалуйста, подожди немного 🍁")
-
-async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not msg: return
-    user_id = msg.from_user.id
-    
-    if user_id in ACTIVE_CHATS:
-        partner = ACTIVE_CHATS[user_id]
-        await safe(ctx.bot.copy_message, chat_id=partner, from_chat_id=user_id, message_id=msg.message_id)
-        return
-        
-    if msg.photo and msg.caption:
-        await on_text(update, ctx)
-        return
-        
-    u = await get_user(user_id)
-    if u and u["status"] == "active":
-        await send_main_menu(ctx.bot, user_id)
-
-async def send_to_admin_chat(bot, prof, u):
-    text = (
-        f"🆕 <b>Новая анкета на модерацию</b>\n\n"
-        f"👤 <b>Пользователь:</b> <code>{prof['tg_id']}</code>\n"
-        f"📞 <b>Телефон:</b> {u['phone']}\n"
-        f"🗣 <b>Слова для кружка:</b> {u['verify_words']}\n\n"
-        f"<b>Анкета:</b>\n"
-        f"👤 <b>{prof['name']}</b>, {prof['age']}\n"
-        f"🏳️‍🌈 Местоимения: {prof['pronouns']}\n"
-        f"📍 Город: {prof['city']}\n"
-        f"🩺 Диагноз: {prof['diagnosis']}\n"
-        f"💭 Зачем пришёл/ла: {prof['reason']}\n"
-        f"🎨 Хобби: {prof['hobby']}"
-    )
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Принять", callback_data=f"adm:approve:{prof['tg_id']}"),
-         InlineKeyboardButton("❌ Отклонить", callback_data=f"adm:reject:{prof['tg_id']}")],
-        [InlineKeyboardButton("✏️ Переделать", callback_data=f"adm:rework:{prof['tg_id']}")]
-    ])
-    try:
-        if prof["video"]: await bot.send_video_note(ADMIN_CHAT_ID, prof["video"])
-        if prof["photo1"]: await bot.send_photo(ADMIN_CHAT_ID, prof["photo1"])
-        await bot.send_message(ADMIN_CHAT_ID, text, reply_markup=kb, parse_mode=ParseMode.HTML)
-    except Exception as e:
-        log.error(f"Err admin chat: {e}")
-
-async def on_admin_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not msg or not msg.text or not msg.reply_to_message: return
-    
-    admin_msg_id = msg.reply_to_message.message_id
-    ticket = await db_exec("SELECT user_id FROM support_tickets WHERE admin_msg_id=?", (admin_msg_id,), fetch="one")
-    
-    if ticket:
-        user_id = ticket["user_id"]
-        sent = await safe(ctx.bot.send_message, user_id, f"🆘 <b>Ответ поддержки:</b>\n\n{esc(msg.text)}", parse_mode=ParseMode.HTML)
-        if sent:
-            await msg.reply_text("✅ Ответ отправлен пользователю.")
-        else:
-            await msg.reply_text("❌ Не удалось отправить (пользователь заблокировал бота?).")
-
-async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != SUPERADMIN_ID: return
-    await update.message.reply_text("🛠 <b>Админ-панель</b>", reply_markup=admin_main_kb(), parse_mode=ParseMode.HTML)
-
-async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    user_id = query.from_user.id
-
-    if data.startswith("adm:"):
-        if user_id != SUPERADMIN_ID: return
-        _, action, tid = data.split(":")
-        tid = int(tid)
-
-        if action == "approve":
-            await db_exec("UPDATE profiles SET approved=1 WHERE tg_id=?", (tid,))
-            await db_exec("UPDATE users SET status='active', banned=0 WHERE tg_id=?", (tid,))
-            await safe(ctx.bot.send_message, tid, "🎉 <b>Твоя анкета одобрена!</b> 🍁\n\nДобро пожаловать в Кленчик. Теперь тебе доступны все функции.\n\nВыбирай раздел ниже 👇", reply_markup=main_menu_kb(tid), parse_mode=ParseMode.HTML)
-            await query.edit_message_reply_markup(reply_markup=None)
-
-        elif action == "reject":
-            await db_exec("UPDATE users SET status='banned', banned=1, ban_reason='Отклонено' WHERE tg_id=?", (tid,))
-            await safe(ctx.bot.send_message, tid, "🚫 <b>Твоя анкета отклонена.</b>\n\nК сожалению, модератор отклонил твою заявку. Доступ к боту заблокирован.", parse_mode=ParseMode.HTML)
-            await query.edit_message_reply_markup(reply_markup=None)
-
-        elif action == "rework":
-            await db_exec("INSERT OR REPLACE INTO admin_states(tg_id, action, target_id) VALUES(?,?,?)", (user_id, "rework", tid))
-            await query.message.reply_text(f"Введи комментарий для {tid} (что именно нужно исправить):")
-        return
-
-    if data.startswith("a:"):
-        if user_id != SUPERADMIN_ID: return
-        parts = data.split(":")
-        act = parts[1]
-
-        if act == "main" or act == "back":
-            await query.edit_message_text("🛠 <b>Админ-панель</b>", reply_markup=admin_main_kb(), parse_mode=ParseMode.HTML)
-
-        elif act == "users":
-            offset = int(parts[2])
-            users = await db_exec("SELECT * FROM users ORDER BY created_at DESC LIMIT 10 OFFSET ?", (offset,), fetch="all")
-            rows = [[InlineKeyboardButton(f"{u['tg_id']} | {u['status']} | VIP{u['vip_level']}", callback_data=f"a:u:{u['tg_id']}")] for u in users]
-            nav = []
-            if offset > 0: nav.append(InlineKeyboardButton("⬅️", callback_data=f"a:users:{offset-10}"))
-            if len(users) == 10: nav.append(InlineKeyboardButton("➡️", callback_data=f"a:users:{offset+10}"))
-            if nav: rows.append(nav)
-            rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="a:back")])
-            await query.edit_message_text(f"👥 Пользователи ({offset+1}-{offset+len(users)}):", reply_markup=InlineKeyboardMarkup(rows))
-
-        elif act == "u":
-            tid = int(parts[2])
-            u = await get_user(tid)
-            if not u: return await query.answer("Пользователь не найден.", show_alert=True)
-            p = await db_exec("SELECT * FROM profiles WHERE tg_id=?", (tid,), fetch="one")
-            txt = f"👤 <b>{tid}</b>\nstatus={u['status']} banned={u['banned']}\nVIP={u['vip_level']} до {u['vip_until'] or '—'}\nlikes={u['likes_left']}, chars={u['chars_limit']}\nhas_prev={u['has_prev_addon']}"
-            if p: txt += f"\n\n<b>{p['name']}</b>, {p['age']}\n{p['diagnosis']}"
-
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🚫 Забанить", callback_data=f"a:ban:{tid}"),
-                 InlineKeyboardButton("✅ Разбанить", callback_data=f"a:unban:{tid}")],
-                [InlineKeyboardButton("👑 Выдать VIP", callback_data=f"a:givevip:{tid}"),
-                 InlineKeyboardButton("🚫 Забрать VIP", callback_data=f"a:takevip:{tid}")],
-                [InlineKeyboardButton("🎁 Выдать доп", callback_data=f"a:givedop:{tid}"),
-                 InlineKeyboardButton("🚫 Забрать доп", callback_data=f"a:takedop:{tid}")],
-                [InlineKeyboardButton("🗑 Удалить анкету", callback_data=f"a:delprof:{tid}")],
-                [InlineKeyboardButton("⬅️ Назад", callback_data="a:users:0")]
-            ])
-            await query.edit_message_text(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
-
-        elif act == "givebyid":
-            await db_exec("INSERT OR REPLACE INTO admin_states(tg_id, action, target_id) VALUES(?,?,?)", (user_id, "givebyid", 0))
-            await query.message.reply_text(
-                "⚙️ <b>Выдача по ID</b>\n\n"
-                "Отправь строку в формате:\n"
-                "<code><tg_id> тип значение1 значение2</code>\n\n"
-                "<b>Примеры:</b>\n"
-                "<code>123456789 вип средний 30</code> — VIP Средний на 30 дней\n"
-                "<code>123456789 доп символы 0</code> — символы до 600\n"
-                "<code>123456789 доп лайки 0</code> — безлимит лайков\n"
-                "<code>123456789 доп возврат 0</code> — возврат анкеты\n"
-                "<code>123456789 доп фото 0</code> — второе фото\n"
-                "<code>123456789 доп инкогнито 1</code> — инкогнито на 1 день",
-                parse_mode=ParseMode.HTML
-            )
-
-        elif act == "takebyid":
-            await db_exec("INSERT OR REPLACE INTO admin_states(tg_id, action, target_id) VALUES(?,?,?)", (user_id, "takebyid", 0))
-            await query.message.reply_text(
-                "🗑 <b>Забрать по ID</b>\n\n"
-                "Отправь строку в формате:\n"
-                "<code><tg_id> тип</code>\n\n"
-                "<b>Примеры:</b>\n"
-                "<code>123456789 вип</code> — снять VIP\n"
-                "<code>123456789 символы</code> — снять доп на символы\n"
-                "<code>123456789 лайки</code> — снять безлимит\n"
-                "<code>123456789 возврат</code> — снять возврат анкеты\n"
-                "<code>123456789 фото</code> — снять второе фото\n"
-                "<code>123456789 инкогнито</code> — снять инкогнито\n"
-                "<code>123456789 все</code> — снять все допы",
-                parse_mode=ParseMode.HTML
-            )
-
-        elif act == "ban":
-            tid = int(parts[2])
-            await db_exec("INSERT OR REPLACE INTO admin_states(tg_id, action, target_id) VALUES(?,?,?)", (user_id, "ban", tid))
-            await query.message.reply_text("Введи причину бана:")
-
-        elif act == "unban":
-            tid = int(parts[2])
-            await upsert_user(tid, banned=0, status="active")
-            await query.message.reply_text("✅ Разбанен.")
-
-        elif act == "givevip":
-            tid = int(parts[2])
-            await db_exec("INSERT OR REPLACE INTO admin_states(tg_id, action, target_id) VALUES(?,?,?)", (user_id, "vip", tid))
-            await query.message.reply_text("Введи уровень (1/2/3) и дней, например: 2 30")
-
-        elif act == "takevip":
-            tid = int(parts[2])
-            await upsert_user(tid, vip_level=0, vip_until=None, chars_limit=300, likes_left=20)
-            await safe(ctx.bot.send_message, tid, "⚠️ Твой VIP был снят администратором.")
-            await query.message.reply_text("✅ VIP снят.")
-
-        elif act == "givedop":
-            tid = int(parts[2])
-            await db_exec("INSERT OR REPLACE INTO admin_states(tg_id, action, target_id) VALUES(?,?,?)", (user_id, "dop", tid))
-            await query.message.reply_text("Введи доп (символы / лайки / возврат / фото / инкогнито) и дней через пробел:")
-
-        elif act == "takedop":
-            tid = int(parts[2])
-            await db_exec("INSERT OR REPLACE INTO admin_states(tg_id, action, target_id) VALUES(?,?,?)", (user_id, "takedop", tid))
-            await query.message.reply_text(
-                "Что снять? Отправь одно слово:\n"
-                "символы / лайки / возврат / фото / инкогнито / все"
-            )
-
-        elif act == "delprof":
-            tid = int(parts[2])
-            await db_exec("INSERT OR REPLACE INTO admin_states(tg_id, action, target_id) VALUES(?,?,?)", (user_id, "delprof", tid))
-            await query.message.reply_text("Причина удаления анкеты:")
-
-        elif act == "pending":
-            pending = await db_exec("SELECT * FROM profiles WHERE approved=0 ORDER BY id DESC LIMIT 20", fetch="all")
-            if not pending: return await query.message.reply_text("Пусто.")
-            for p in pending:
-                u = await get_user(p["tg_id"])
-                await send_to_admin_chat(ctx.bot, p, u)
-            await query.message.reply_text("Отправлено в чат.")
-
-        elif act == "bans":
-            bans = await db_exec("SELECT * FROM users WHERE banned=1 LIMIT 20", fetch="all")
-            if not bans: return await query.message.reply_text("Нет забаненных.")
-            txt = "\n".join(f"{u['tg_id']} — {u['ban_reason']}" for u in bans)
-            await query.message.reply_text(txt)
-
-        elif act == "stats":
-            total = (await db_exec("SELECT COUNT(*) FROM users", fetch="one"))[0]
-            active = (await db_exec("SELECT COUNT(*) FROM users WHERE status='active'", fetch="one"))[0]
-            banned = (await db_exec("SELECT COUNT(*) FROM users WHERE banned=1", fetch="one"))[0]
-            vip = (await db_exec("SELECT COUNT(*) FROM users WHERE vip_level>0", fetch="one"))[0]
-            await query.message.reply_text(f"📊 Всего: {total}\nАктивных: {active}\nЗабанено: {banned}\nС VIP: {vip}")
-
-        return
-
-    u = await get_user(user_id)
-    if not u: return
-
-    if data == "menu:back":
-        WAITING_USERS.discard(user_id)
-        await query.message.edit_text(
-            "🍁 <b>Главное меню Кленчика</b>\n\nВыбери, что хочешь сделать:",
-            reply_markup=main_menu_kb(user_id),
-            parse_mode=ParseMode.HTML
-        )
-
-    elif data == "menu:ankety":
-        await refresh_likes(user_id)
-        u = await get_user(user_id)
-        if u["likes_left"] <= 0: return await query.answer("❤️ Лимит лайков исчерпан. Купи доп в магазине.", show_alert=True)
-        await show_next_profile(query, u, 0)
-
-    elif data.startswith("skip:"):
-        parts = data.split(":")
-        offset = int(parts[1])
-        skipped_id = int(parts[2])
-        await upsert_user(user_id, prev_anketa_id=skipped_id)
-        await show_next_profile(query, u, offset)
-
-    elif data.startswith("prev:"):
-        target_id = int(data.split(":")[1])
-        has_prev = (u["vip_level"] == 3) or (u["has_prev_addon"] == 1)
-        if not has_prev:
-            return await query.answer("⏪ Доступно только с VIP Высоким или допом «Возврат анкеты».", show_alert=True)
-        prof = await db_exec("SELECT * FROM profiles WHERE tg_id=?", (target_id,), fetch="one")
-        if not prof:
-            return await query.answer("Анкета больше недоступна.", show_alert=True)
-        text = f"👤 <b>{prof['name']}</b>, {prof['age']} ({prof['pronouns']})\n📍 {prof['city']}\n\n🩺 {prof['diagnosis']}\n💭 {prof['reason']}\n🎨 {prof['hobby']}"
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("❤️ Лайк", callback_data=f"like:{prof['tg_id']}"),
-             InlineKeyboardButton("➡️ Скип", callback_data=f"skip:0:{prof['tg_id']}")],
-            [InlineKeyboardButton("⬅️ В меню", callback_data="menu:back")]
-        ])
-        if prof["photo1"]:
-            await query.message.reply_photo(prof["photo1"], caption=text, reply_markup=kb, parse_mode=ParseMode.HTML)
-        else:
-            await query.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-
-    elif data.startswith("like:"):
-        target = int(data.split(":")[1])
-        await refresh_likes(user_id)
-        u = await get_user(user_id)
-        if u["likes_left"] <= 0: return await query.answer("❤️ Лимит лайков исчерпан.", show_alert=True)
-        await upsert_user(user_id, likes_left=u["likes_left"] - 1)
-        await db_exec("INSERT INTO likes(from_tg, to_tg, created_at) VALUES(?,?,?)", (user_id, target, now_iso()))
-
-        mutual = await db_exec("SELECT 1 FROM likes WHERE from_tg=? AND to_tg=?", (target, user_id), fetch="one")
-        if mutual:
-            target_user = await get_user(target)
-            
-            t_un = target_user["username"]
-            c_un = u["username"]
-            
-            t_display = f"@{esc(t_un)}" if t_un else f'<a href="tg://user?id={target}">Написать в ЛС</a>'
-            c_display = f"@{esc(c_un)}" if c_un else f'<a href="tg://user?id={user_id}">Написать в ЛС</a>'
-            
-            await safe(ctx.bot.send_message, target, f"💞 <b>Взаимная симпатия!</b> 🍁\n\nКому-то понравилась твоя анкета, и вы совпали!\nКонтакт для связи: {c_display}\n\n<i>Напиши первым, не стесняйся 🍁</i>", parse_mode=ParseMode.HTML)
-            await safe(ctx.bot.send_message, user_id, f"💞 <b>Взаимная симпатия!</b> 🍁\n\nКому-то понравилась твоя анкета, и вы совпали!\nКонтакт для связи: {t_display}\n\n<i>Напиши первым, не стесняйся 🍁</i>", parse_mode=ParseMode.HTML)
-            
-        await query.answer("❤️ Лайк отправлен")
-        await show_next_profile(query, u, 0)
-
-    elif data == "menu:shop":
-        rows = [[InlineKeyboardButton(text=v[1], callback_data=f"buyinfo:{k}")] for k, v in PRICES.items()]
-        rows.append([InlineKeyboardButton("⬅️ Меню", callback_data="menu:back")])
-        await query.message.edit_text(
-            "🛒 <b>Магазин Кленчика</b> 🍁\n\nВыбери товар для подробностей:",
-            reply_markup=InlineKeyboardMarkup(rows),
-            parse_mode=ParseMode.HTML
-        )
-
-    elif data.startswith("buyinfo:"):
-        key = data.split(":")[1]
-        price, name = PRICES[key]
-        desc = {
-            "vip_low": "🟢 <b>40 лайков в день</b>\n• Лимит символов: 600\n• Приоритет в выдаче анкет: средний",
-            "vip_mid": "🟡 <b>60 лайков в день</b>\n• Лимит символов: 800\n• Возможность загрузить 2 фото\n• Приоритет в выдаче анкет: повышенный",
-            "vip_high": "🔴 <b>Безлимитные лайки</b>\n• Лимит символов: 1000\n• 2 фото + видео (15 сек)\n• Возврат к предыдущей анкете\n• Приоритет в выдаче анкет: максимальный",
-            "chars_600": "📝 Разблокирует возможность писать более длинные тексты в анкете (до 600 символов вместо 300).",
-            "unlimited_likes": "❤️ Позволяет ставить безлимитное количество лайков на 1 день.",
-            "prev_anketa": "⏪ Если ты случайно скипнул интересного человека, эта функция позволит вернуться к его анкете.",
-            "second_media": "📸 Позволяет прикрепить дополнительное фото (или видео) к твоей анкете.",
-            "incognito_day": "🕵️ Открывает доступ к анонимному чату со случайным собеседником на 1 день."
-        }
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("💳 Купить", callback_data=f"buy:{key}")], [InlineKeyboardButton("⬅️ Назад", callback_data="menu:shop")]])
-        await query.message.edit_text(f"{desc.get(key, '')}\n\n💰 Цена: <b>{price}₽</b>", reply_markup=kb, parse_mode=ParseMode.HTML)
-
-    elif data.startswith("buy:"):
-        key = data.split(":")[1]
-        price, name = PRICES[key]
-        contact = get_payment_contact()
-        
-        await query.message.edit_text(
-            f"💳 <b>Оплата</b> 🍁\n\n"
-            f"Товар: <b>{name}</b>\n"
-            f"Стоимость: <b>{price}₽</b>\n\n"
-            f"Чтобы купить, напиши нашему менеджеру: <b>{esc(contact)}</b>\n\n"
-            f"<i>После оплаты менеджер вручную выдаст тебе доступ. Это займёт немного времени.</i>",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="menu:shop")]]),
-            parse_mode=ParseMode.HTML
-        )
-        await safe(
-            ctx.bot.send_message, SUPERADMIN_ID,
-            f"💰 <b>Покупка</b>\n"
-            f"tg_id: <code>{user_id}</code>\n"
-            f"@{esc(u['username']) if u['username'] else '—'}\n"
-            f"Товар: {name}\n"
-            f"Цена: {price}₽\n\n"
-            f"<i>Выдать через /admin → «Выдать по ID»</i>",
-            parse_mode=ParseMode.HTML
-        )
-
-    elif data == "menu:incognito":
-        until = u["incognito_until"]
-        has_access = until and datetime.fromisoformat(until) > datetime.utcnow()
-        
-        if not has_access:
-            return await query.answer("🕵️ У тебя нет доступа. Купи в магазине за 30₽/день.", show_alert=True)
-            
-        if user_id in ACTIVE_CHATS:
-            return await query.answer("Ты уже в чате. Напиши /stop, чтобы выйти.", show_alert=True)
-            
-        await query.message.edit_text(
-            "💬 <b>Анонимный чат</b> 🍁\n\n"
-            "Здесь ты можешь анонимно пообщаться со случайным человеком. Никто не увидит твоё имя или фото — только сообщения.\n\n"
-            "Нажми «Искать собеседника», и мы найдём тебе пару.\n\n"
-            "⚠️ <i>Чтобы выйти из чата, напиши /stop или нажми «Остановить чат».</i>",
-            reply_markup=incognito_menu_kb(),
-            parse_mode=ParseMode.HTML
-        )
-
-    elif data == "incog:search":
-        until = u["incognito_until"]
-        has_access = until and datetime.fromisoformat(until) > datetime.utcnow()
-        if not has_access:
-            return await query.answer("Доступ истёк.", show_alert=True)
-
-        if user_id in ACTIVE_CHATS:
-            return await query.answer("Ты уже в чате. Напиши /stop.", show_alert=True)
-            
-        if user_id in WAITING_USERS:
-            return await query.answer("Ты уже в поиске. Нажми /stop.", show_alert=True)
-
-        if WAITING_USERS:
-            partner_id = WAITING_USERS.pop()
-            ACTIVE_CHATS[user_id] = partner_id
-            ACTIVE_CHATS[partner_id] = user_id
-
-            msg_pair = "✅ <b>Собеседник найден!</b> 🍁\n\nТы общаешься анонимно. Отправь сообщение.\nЧтобы выйти, нажми /stop."
-            await safe(query.bot.send_message, user_id, msg_pair, reply_markup=incog_active_kb(), parse_mode=ParseMode.HTML)
-            await safe(query.bot.send_message, partner_id, msg_pair, reply_markup=incog_active_kb(), parse_mode=ParseMode.HTML)
-            await query.message.delete()
-        else:
-            WAITING_USERS.add(user_id)
-            await query.message.edit_text(
-                "🔍 <b>Ищем собеседника...</b> 🍁\n\n"
-                "Пожалуйста, подожди. Как только кто-то зайдёт, вы сразу начнёте общение.\n\n"
-                "Чтобы отменить поиск, напиши /stop или нажми кнопку ниже.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Отменить поиск", callback_data="incog:stop")]]),
-                parse_mode=ParseMode.HTML
-            )
-
-    elif data == "incog:stop":
-        WAITING_USERS.discard(user_id)
-        
-        if user_id in ACTIVE_CHATS:
-            partner_id = ACTIVE_CHATS.pop(user_id)
-            ACTIVE_CHATS.pop(partner_id, None)
-            
-            await query.message.edit_text("🛑 Ты покинул чат.", reply_markup=incognito_menu_kb())
-            await safe(query.bot.send_message, partner_id, "🛑 Собеседник покинул чат. Ты можешь найти нового.", reply_markup=incognito_menu_kb())
-        else:
-            await query.message.edit_text("🛑 Поиск отменён.", reply_markup=incognito_menu_kb())
-
-    elif data == "menu:support":
-        await db_exec("UPDATE users SET pending_action='support' WHERE tg_id=?", (user_id,))
-        await query.message.edit_text(
-            "🆘 <b>Поддержка</b> 🍁\n\n"
-            "Есть вопрос или проблема? Напиши свой вопрос <b>одним сообщением</b>, и администратор ответит тебе прямо здесь.\n\n"
-            "<i>Отвечаем быстро, если мы онлайн 🍁</i>",
-            parse_mode=ParseMode.HTML
-        )
-
-    elif data == "menu:profile":
-        prof = await db_exec("SELECT * FROM profiles WHERE tg_id=?", (user_id,), fetch="one")
-        if not prof:
-            return await query.answer("Анкета не найдена.", show_alert=True)
-        text = (
-            f"👤 <b>Моя анкета</b> 🍁\n\n"
-            f"<b>{prof['name']}</b>, {prof['age']} ({prof['pronouns']})\n"
-            f"📍 {prof['city']}\n"
-            f"🩺 {prof['diagnosis']}\n"
-            f"💭 {prof['reason']}\n"
-            f"🎨 {prof['hobby']}\n\n"
-            f"👑 <b>VIP:</b> {u['vip_level']} (до {u['vip_until'] or '—'})\n"
-            f"❤️ <b>Лайков:</b> {u['likes_left']}\n"
-            f"⚙️ <b>Статус:</b> {get_status_ru(u['status'])}"
-        )
-        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Меню", callback_data="menu:back")]]), parse_mode=ParseMode.HTML)
-
-async def show_next_profile(query, u, offset):
-    async with sqlite3.connect(DB_PATH) as conn:
+def db_get_user(uid, tg_user=None):
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
         conn.row_factory = sqlite3.Row
-        prof = conn.execute(
-            "SELECT p.*, u.vip_level FROM profiles p JOIN users u ON u.tg_id=p.tg_id WHERE p.approved=1 AND p.tg_id!=? ORDER BY u.vip_level DESC, p.id DESC LIMIT 1 OFFSET ?",
-            (query.from_user.id, offset)
-        ).fetchone()
+        row = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+        if not row:
+            now = datetime.now(timezone.utc)
+            conn.execute(
+                "INSERT OR IGNORE INTO users(user_id,created_at,likes_date,anon_free_date) VALUES(?,?,?,?)",
+                (uid, now.isoformat(), now.date().isoformat(), now.date().isoformat()),
+            )
+            conn.commit()
+            row = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+        if tg_user is not None:
+            uname = tg_user.username
+            fname = (tg_user.full_name or "").strip() or None
+            if row["username"] != uname or row["full_name"] != fname:
+                conn.execute(
+                    "UPDATE users SET username=?, full_name=? WHERE user_id=?",
+                    (uname, fname, uid),
+                )
+                conn.commit()
+                row = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+        return dict(row)
 
-    has_prev = (u["vip_level"] == 3) or (u["has_prev_addon"] == 1)
 
-    if not prof:
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В меню", callback_data="menu:back")]])
-        if u["prev_anketa_id"] and has_prev:
-            kb.inline_keyboard.insert(0, [InlineKeyboardButton("⏪ Вернуть пропущенную", callback_data=f"prev:{u['prev_anketa_id']}")])
-        return await query.message.edit_text("🍁 На данный момент анкет больше нет.", reply_markup=kb)
+def db_set(uid, **kw):
+    if not kw:
+        return
+    sets = ",".join(f"{k}=?" for k in kw)
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        conn.execute(f"UPDATE users SET {sets} WHERE user_id=?", (*kw.values(), uid))
+        conn.commit()
 
-    text = f"👤 <b>{prof['name']}</b>, {prof['age']} ({prof['pronouns']})\n📍 {prof['city']}\n\n🩺 <b>Диагноз:</b> {prof['diagnosis']}\n💭 <b>Зачем пришёл/ла:</b> {prof['reason']}\n🎨 <b>Хобби:</b> {prof['hobby']}"
 
-    kb_list = [
-        [InlineKeyboardButton("❤️ Лайк", callback_data=f"like:{prof['tg_id']}"),
-         InlineKeyboardButton("➡️ Пропустить", callback_data=f"skip:{offset+1}:{prof['tg_id']}")],
-        [InlineKeyboardButton("⬅️ В меню", callback_data="menu:back")]
+def db_get_profile(uid):
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        conn.row_factory = sqlite3.Row
+        r = conn.execute("SELECT * FROM profiles WHERE user_id=?", (uid,)).fetchone()
+        return dict(r) if r else None
+
+
+def db_save_profile(uid, name, age, city, diagnosis, about):
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO profiles(user_id,name,age,city,diagnosis,about,approved,rejected) "
+            "VALUES(?,?,?,?,?,?,0,0)",
+            (uid, name, age, city, diagnosis, about),
+        )
+        conn.commit()
+
+
+def db_get_price(key):
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        r = conn.execute("SELECT val FROM prices WHERE key=?", (key,)).fetchone()
+        return r[0] if r else 0
+
+
+def db_set_price(key, val):
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        conn.execute("INSERT OR REPLACE INTO prices(key,val) VALUES(?,?)", (key, val))
+        conn.commit()
+
+
+def db_save_admin_msg(mid, uid, mtype):
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        conn.execute("INSERT OR REPLACE INTO admin_msgs(msg_id,user_id,mtype) VALUES(?,?,?)",
+                     (mid, uid, mtype))
+        conn.commit()
+
+
+def db_get_admin_msg(mid):
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        r = conn.execute("SELECT user_id,mtype FROM admin_msgs WHERE msg_id=?", (mid,)).fetchone()
+        return r
+
+
+def vip_char_limit(v):
+    return {0: 300, 1: 500, 2: 800, 3: 10 ** 9}.get(v, 300)
+
+
+def vip_like_limit(v):
+    return {0: 20, 1: 40, 2: 60, 3: 10 ** 9}.get(v, 20)
+
+
+def vip_label(v):
+    return {0: "нет", 1: "VIP 1 (Низкий)", 2: "VIP 2 (Средний)", 3: "VIP 3 (Высокий)"}.get(v, "нет")
+
+
+def ensure_daily_likes(uid):
+    u = db_get_user(uid)
+    today = datetime.now(timezone.utc).date().isoformat()
+    if u["likes_date"] != today:
+        db_set(uid, likes_left=vip_like_limit(u["vip"]), likes_date=today)
+
+
+def add_days(base_iso, days):
+    now = datetime.now(timezone.utc)
+    if base_iso:
+        try:
+            base = datetime.fromisoformat(base_iso)
+            if base.tzinfo is None:
+                base = base.replace(tzinfo=timezone.utc)
+            if base > now:
+                return (base + timedelta(days=days)).isoformat()
+        except Exception:
+            pass
+    return (now + timedelta(days=days)).isoformat()
+
+
+def parse_profile(text):
+    required = ["Имя:", "Возраст:", "Город:", "Диагноз:", "Описание о себе:"]
+    keys = ["name", "age", "city", "diagnosis", "about"]
+    data = {}
+    for line in text.strip().splitlines():
+        line = line.strip()
+        for k, pre in zip(keys, required):
+            if line.startswith(pre):
+                data[k] = line[len(pre):].strip()
+    if len(data) < 5 or any(not v for v in data.values()):
+        return None
+    return data
+
+
+AGREEMENT_TEXT = (
+    "🍁 <b>Пользовательское соглашение «Клёнчик»</b>\n\n"
+    "Нажимая «Согласен», вы подтверждаете, что ознакомлены и полностью принимаете условия:\n\n"
+    "1. <b>Ответственность.</b> Администрация «Клёнчика» не несёт ответственности за содержание переписки "
+    "в анонимном чате и за любые действия, к которым она может привести.\n"
+    "2. <b>Анонимный чат.</b> Все диалоги анонимны. Всё, что происходит после общения в анонимном чате "
+    "(в т.ч. переход в личные сообщения), — на ваш собственный страх и риск.\n"
+    "3. <b>Данные.</b> Ваш номер телефона используется только для верификации и не передаётся третьим лицам.\n"
+    "4. <b>Контент.</b> Запрещены оскорбления, угрозы, распространение незаконной информации, спам и попытки "
+    "деанонимизации.\n"
+    f"5. <b>Блокировки.</b> При нарушении правил, жалобах или отказе от соглашения аккаунт может быть заблокирован. "
+    f"Разбан — от {UNBAN_PRICE} ₽ через менеджера {MANAGER}.\n"
+    "6. <b>Возврат.</b> Покупки виртуальных товаров не подлежат возврату.\n"
+    "7. <b>Изменения.</b> Администрация вправе менять условия и цены в любое время.\n\n"
+    "Если вы не согласны — нажмите «Отказаться»."
+)
+
+BAN_ON_REFUSE = (
+    "🚫 <b>Вы были заблокированы</b>\n\n"
+    "Причина: отказ от пользовательского соглашения «Клёнчика».\n\n"
+    f"Разбан за <b>{UNBAN_PRICE} ₽</b> у менеджера: {MANAGER}"
+)
+
+PROFILE_REJECTED = (
+    "❌ <b>Ваша заявка была отклонена</b>\n\n"
+    "В связи с этим ваш аккаунт заблокирован.\n\n"
+    f"Разбан за <b>{UNBAN_PRICE} ₽</b> у менеджера: {MANAGER}"
+)
+
+
+def kb_agree():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Согласен", callback_data="agree:yes"),
+        InlineKeyboardButton("❌ Отказаться", callback_data="agree:no"),
+    ]])
+
+
+def kb_contact():
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("📱 Поделиться контактом", request_contact=True)]],
+        resize_keyboard=True, one_time_keyboard=True,
+    )
+
+
+def kb_main(is_admin=False):
+    rows = [
+        [InlineKeyboardButton("🍁 Анкеты", callback_data="menu:profiles"),
+         InlineKeyboardButton("💬 Анонимный чат", callback_data="menu:anon")],
+        [InlineKeyboardButton("🛒 Магазин", callback_data="menu:shop"),
+         InlineKeyboardButton("👤 Мой профиль", callback_data="menu:profile")],
+        [InlineKeyboardButton("🆘 Поддержка", callback_data="menu:support")],
     ]
-    if u["prev_anketa_id"] and has_prev:
-        kb_list.insert(1, [InlineKeyboardButton("⏪ Вернуть пропущенную", callback_data=f"prev:{u['prev_anketa_id']}")])
+    if is_admin:
+        rows.append([InlineKeyboardButton("🛠 Админ-панель", callback_data="admin:main")])
+    return InlineKeyboardMarkup(rows)
 
-    kb = InlineKeyboardMarkup(kb_list)
 
-    if prof["photo1"]:
-        await query.message.reply_photo(prof["photo1"], caption=text, reply_markup=kb, parse_mode=ParseMode.HTML)
-    else:
-        await query.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+def kb_back(cb="menu:main"):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=cb)]])
+
+
+def kb_profile_view():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Переписать анкету", callback_data="profile:edit")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="menu:main")],
+    ])
+
+
+def kb_anon():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔎 Найти собеседника", callback_data="anon:find")],
+        [InlineKeyboardButton("🛑 Стоп", callback_data="anon:stop")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="menu:main")],
+    ])
+
+
+def kb_shop():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🍁 VIP 1 — Низкий", callback_data="shop:vip1")],
+        [InlineKeyboardButton("🍁 VIP 2 — Средний", callback_data="shop:vip2")],
+        [InlineKeyboardButton("🍁 VIP 3 — Высокий", callback_data="shop:vip3")],
+        [InlineKeyboardButton("💬 Доступ в анон-чат", callback_data="shop:anon")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="menu:main")],
+    ])
+
+
+def kb_app_review(uid):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Принять", callback_data=f"app:accept:{uid}"),
+         InlineKeyboardButton("❌ Отклонить", callback_data=f"app:reject:{uid}")],
+        [InlineKeyboardButton("✏️ Переписать", callback_data=f"app:rewrite:{uid}")],
+    ])
+
+
+def kb_ticket(uid):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✉️ Ответить", callback_data=f"ticket:reply:{uid}")
+    ]])
+
+
+def kb_report(uid):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚫 Забанить", callback_data=f"report:ban:{uid}"),
+         InlineKeyboardButton("✅ Игнорировать", callback_data=f"report:ignore:{uid}")],
+    ])
+
+
+def kb_admin():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 Пользователей", callback_data="admin:count")],
+        [InlineKeyboardButton("🔨 Забанить", callback_data="admin:ban"),
+         InlineKeyboardButton("🔓 Разбанить", callback_data="admin:unban")],
+        [InlineKeyboardButton("🎁 Выдать VIP", callback_data="admin:give_vip"),
+         InlineKeyboardButton("🗑 Снять VIP", callback_data="admin:take_vip")],
+        [InlineKeyboardButton("🎁 Выдать анон", callback_data="admin:give_anon"),
+         InlineKeyboardButton("🗑 Снять анон", callback_data="admin:take_anon")],
+        [InlineKeyboardButton("💲 Цены", callback_data="admin:prices")],
+        [InlineKeyboardButton("📋 Список юзеров", callback_data="admin:users")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="menu:main")],
+    ])
+
+
+def kb_admin_prices():
+    keys = ["vip1", "vip2", "vip3", "anon", "unban"]
+    rows = [[InlineKeyboardButton(f"✏️ {k} — {db_get_price(k)}₽", callback_data=f"admin:price_set:{k}")]
+            for k in keys]
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="admin:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def safe_send(bot, chat_id, text, **kw):
     try:
-        await query.message.delete()
-    except:
-        pass
+        return await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, **kw)
+    except Exception:
+        return None
 
-def translate_dop(dop: str) -> str:
-    dop = dop.lower().strip()
-    mapping = {
-        "символы": "chars600", "символы600": "chars600", "chars600": "chars600",
-        "лайки": "unlimited", "безлимит": "unlimited", "unlimited": "unlimited",
-        "возврат": "prev", "prev": "prev",
-        "фото": "second", "second": "second",
-        "инкогнито": "incognito", "incognito": "incognito",
-        "все": "all", "all": "all"
-    }
-    return mapping.get(dop, dop)
 
-async def _grant_dop(tid: int, dop: str, days: int):
-    dop = translate_dop(dop)
-    if dop == "chars600":
-        await upsert_user(tid, chars_limit=600)
-    elif dop == "unlimited":
-        await upsert_user(tid, likes_left=999999)
-    elif dop == "prev":
-        await upsert_user(tid, has_prev_addon=1)
-    elif dop == "second":
-        await upsert_user(tid, photos_used=0)
-    elif dop == "incognito":
-        until = (datetime.utcnow() + timedelta(days=max(days, 1))).isoformat()
-        await upsert_user(tid, incognito_until=until)
+async def notify_user(bot, uid, text):
+    await safe_send(bot, uid, text)
+    await safe_send(bot, uid, f"Ваш ID: <code>{uid}</code>")
 
-async def _take_dop(tid: int, dop: str):
-    dop = translate_dop(dop)
-    if dop == "chars600":
-        await upsert_user(tid, chars_limit=300)
-    elif dop == "unlimited":
-        await upsert_user(tid, likes_left=20)
-    elif dop == "prev":
-        await upsert_user(tid, has_prev_addon=0, prev_anketa_id=None)
-    elif dop == "second":
-        await upsert_user(tid, photos_used=0)
-    elif dop == "incognito":
-        await upsert_user(tid, incognito_until=None)
-    elif dop == "all":
-        await upsert_user(tid, chars_limit=300, likes_left=20, has_prev_addon=0, prev_anketa_id=None, incognito_until=None)
 
-async def handle_admin_input(msg, ctx, state_row):
-    action = state_row["action"]
-    tid = state_row["target_id"]
-    text = msg.text.strip()
+async def to_admin(bot, topic, text, **kw):
+    if not ADMIN_CHAT_ID:
+        return None
+    return await safe_send(bot, ADMIN_CHAT_ID, text, **_tk(topic), **kw)
 
-    await db_exec("DELETE FROM admin_states WHERE tg_id=?", (msg.from_user.id,))
 
-    if action == "rework":
-        await db_exec("UPDATE profiles SET approved=0 WHERE tg_id=?", (tid,))
-        await db_exec("UPDATE users SET status='awaiting_form' WHERE tg_id=?", (tid,))
-        await safe(ctx.bot.send_message, tid, f"✏️ <b>Твою анкету нужно переделать.</b>\n\n💬 <b>Комментарий модератора:</b>\n{text}\n\nОтправь /start, чтобы заполнить анкету заново.", parse_mode=ParseMode.HTML)
-        await msg.reply_text("✅ Комментарий отправлен.")
+async def is_admin(bot, uid):
+    if uid == ADMIN_ID:
+        return True
+    try:
+        m = await bot.get_chat_member(ADMIN_CHAT_ID, uid)
+        return m.status in ("creator", "administrator")
+    except Exception:
+        return False
 
-    elif action == "ban":
-        await upsert_user(tid, banned=1, ban_reason=text, status="banned")
-        await safe(ctx.bot.send_message, tid, f"🚫 <b>Доступ закрыт.</b>\n\nПричина: {text}", parse_mode=ParseMode.HTML)
-        await msg.reply_text("🚫 Пользователь забанен.")
 
-    elif action == "delprof":
-        await db_exec("DELETE FROM profiles WHERE tg_id=?", (tid,))
-        await db_exec("UPDATE users SET status='rejected' WHERE tg_id=?", (tid,))
-        await safe(ctx.bot.send_message, tid, f"🗑 <b>Твоя анкета удалена модератором.</b>\n\nПричина: {text}", parse_mode=ParseMode.HTML)
-        await msg.reply_text("🗑 Анкета удалена.")
+def get_partner(uid):
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        r = conn.execute(
+            "SELECT user_a, user_b FROM anon_pairs WHERE user_a=? OR user_b=?",
+            (uid, uid),
+        ).fetchone()
+        if not r:
+            return None
+        return r[1] if r[0] == uid else r[0]
 
-    elif action == "vip":
+
+def anon_time_left(uid):
+    u = db_get_user(uid)
+    today = datetime.now(timezone.utc).date().isoformat()
+    if u["anon_free_date"] != today:
+        db_set(uid, anon_free_date=today, anon_free_used=0)
+        u = db_get_user(uid)
+    if u["anon_until"]:
         try:
-            lvl, days = map(int, text.split())
-            until = (datetime.utcnow() + timedelta(days=days)).isoformat()
-            lim = VIP_LIMITS.get(lvl, VIP_LIMITS[1])
-            await upsert_user(tid, vip_level=lvl, vip_until=until, chars_limit=lim["chars"], likes_left=lim["likes"])
-            await safe(ctx.bot.send_message, tid, f"👑 <b>Тебе выдан VIP {lvl} на {days} дней!</b> 🍁", parse_mode=ParseMode.HTML)
-            await msg.reply_text("✅ VIP выдан.")
-        except:
-            await msg.reply_text("❌ Ошибка формата.")
+            until = datetime.fromisoformat(u["anon_until"])
+            if until.tzinfo is None:
+                until = until.replace(tzinfo=timezone.utc)
+            if until > datetime.now(timezone.utc):
+                return int((until - datetime.now(timezone.utc)).total_seconds())
+        except Exception:
+            pass
+    if not u["anon_free_used"]:
+        return ANON_FREE_MIN * 60
+    return 0
 
-    elif action == "dop":
-        parts = text.split()
-        if len(parts) != 2: return await msg.reply_text("❌ Формат: доп дней")
-        dop, days = parts[0], int(parts[1])
-        await _grant_dop(tid, dop, days)
-        await safe(ctx.bot.send_message, tid, f"🎁 <b>Тебе выдан доп: {dop}</b> 🍁", parse_mode=ParseMode.HTML)
-        await msg.reply_text("✅ Выдано.")
 
-    elif action == "takedop":
-        await _take_dop(tid, text.strip())
-        await safe(ctx.bot.send_message, tid, "⚠️ Один из твоих допов был снят администратором.")
-        await msg.reply_text("✅ Снято.")
-
-    elif action == "givebyid":
-        parts = text.split()
-        if len(parts) < 2: return await msg.reply_text("❌ Формат: <tg_id> <тип> ...")
+async def ban_mw(update, ctx):
+    user = update.effective_user
+    if not user or user.id == ADMIN_ID:
+        return
+    u = db_get_user(user.id, user)
+    if u["banned"]:
         try:
-            target = int(parts[0])
-        except:
-            return await msg.reply_text("❌ tg_id должен быть числом.")
-        kind = parts[1].lower()
-        target_user = await get_user(target)
-        if not target_user:
-            return await msg.reply_text("❌ Пользователь не найден в базе.")
+            await ctx.bot.send_message(
+                user.id,
+                f"🚫 Вы забанены.\nПричина: {u['ban_reason'] or 'нарушение правил'}\n\n"
+                f"Разбан за <b>{UNBAN_PRICE} ₽</b> у {MANAGER}\nВаш ID: <code>{user.id}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        raise ApplicationHandlerStop
 
-        if kind in ("вип", "vip"):
+
+async def ban_cb_mw(update, ctx):
+    q = update.callback_query
+    if not q:
+        return
+    user = q.from_user
+    if not user or user.id == ADMIN_ID:
+        return
+    u = db_get_user(user.id, user)
+    if u["banned"]:
+        await q.answer(f"Забанены. Разбан {UNBAN_PRICE}₽ у {MANAGER}", show_alert=True)
+        raise ApplicationHandlerStop
+
+
+async def cmd_start(update, ctx):
+    msg = update.effective_message
+    uid = update.effective_user.id
+    if get_partner(uid):
+        return await msg.reply_text("🛑 Сначала завершите анонимный чат через кнопку «Стоп».")
+    u = db_get_user(uid, update.effective_user)
+    if u["banned"]:
+        return await msg.reply_text(
+            f"🚫 Вы забанены.\nПричина: {u['ban_reason'] or 'нарушение'}\n"
+            f"Разбан за <b>{UNBAN_PRICE} ₽</b> у {MANAGER}\nВаш ID: <code>{uid}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+    if not u["agreed"]:
+        return await msg.reply_text(AGREEMENT_TEXT, parse_mode=ParseMode.HTML, reply_markup=kb_agree())
+    if not u["phone"]:
+        return await ask_phone(msg)
+    p = db_get_profile(uid)
+    if not p or p["rejected"]:
+        return await start_circle(msg, ctx, uid)
+    if not p["approved"]:
+        return await msg.reply_text(
+            "⏳ Анкета на модерации.",
+            reply_markup=kb_main(uid == ADMIN_ID),
+        )
+    await msg.reply_text(
+        "🍁 <b>Главное меню</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_main(uid == ADMIN_ID),
+    )
+
+
+async def ask_phone(msg):
+    await msg.reply_text(
+        "📱 <b>Верификация телефона</b>\n\n"
+        "Нажмите кнопку ниже, чтобы поделиться контактом.\n\n"
+        "🔒 Номер сохраняется только для верификации и не передаётся третьим лицам.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_contact(),
+    )
+
+
+async def start_circle(msg, ctx, uid):
+    phrase = " · ".join(random.sample(CODE_WORDS, 3))
+    db_set(uid, circle_phrase=phrase, circle_file_id=None)
+    await msg.reply_text(
+        "🎥 <b>Видео-кружок с кодовой фразой</b>\n\n"
+        "Запишите видео-кружок и произнесите:\n\n"
+        f"<code>{phrase}</code>\n\n"
+        "📌 Требования:\n"
+        "• Лицо в кадре, не размыто, свет.\n"
+        "• Длительность 5–30 сек.\n"
+        "• Голос настоящий.\n"
+        "• Чужие видео нельзя.\n\n"
+        "🕹 Иконка камеры (📷) справа снизу от строки ввода → «Видео-кружок» → удерживайте запись.\n\n"
+        "Если пришлёте не видео-кружок — попрошу снова.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+async def handle_contact(update, ctx):
+    msg = update.effective_message
+    uid = update.effective_user.id
+    if msg.contact.user_id and msg.contact.user_id != uid:
+        return await msg.reply_text("❌ Поделитесь своим контактом.")
+    db_set(uid, phone=msg.contact.phone_number)
+    await msg.reply_text("✅ Телефон сохранён.", reply_markup=ReplyKeyboardRemove())
+    await start_circle(msg, ctx, uid)
+
+
+async def handle_circle(update, ctx, u):
+    msg = update.effective_message
+    db_set(u["user_id"], circle_file_id=msg.video_note.file_id)
+    limit = vip_char_limit(u["vip"])
+    limit_txt = "без ограничений" if limit >= 10**9 else f"{limit} символов"
+    await msg.reply_text(
+        "✅ Кружок получен.\n\n"
+        "📝 Заполните анкету строго по шаблону:\n\n"
+        f"<code>{PROFILE_TEMPLATE}</code>\n\n"
+        "• Нажмите на шаблон — скопируется.\n"
+        "• Все поля обязательны.\n"
+        f"• Лимит: <b>{limit_txt}</b>.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def handle_profile(update, ctx, u, text):
+    msg = update.effective_message
+    uid = u["user_id"]
+    limit = vip_char_limit(u["vip"])
+    if len(text) > limit:
+        over = len(text) - limit
+        return await msg.reply_text(
+            f"⚠️ Анкета превышает лимит.\nЛимит: <b>{limit}</b>.\nСейчас: <b>{len(text)}</b>.\n"
+            f"Сократите на <b>{over}</b> символ(ов).",
+            parse_mode=ParseMode.HTML,
+        )
+    data = parse_profile(text)
+    if not data:
+        return await msg.reply_text(
+            "❌ Анкета заполнена не по форме.\n\n"
+            f"<code>{PROFILE_TEMPLATE}</code>\n\n"
+            "Заполните заново.",
+            parse_mode=ParseMode.HTML,
+        )
+    db_save_profile(uid, data["name"], data["age"], data["city"], data["diagnosis"], data["about"])
+    await msg.reply_text("✅ Анкета отправлена на модерацию.", reply_markup=kb_main(uid == ADMIN_ID))
+
+    profile_text = (
+        f"🍁 <b>Новая анкета</b>\n\n"
+        f"Юзер: <code>{uid}</code> @{update.effective_user.username or '-'}\n"
+        f"Телефон: <code>{u['phone']}</code>\n"
+        f"Фраза: <code>{u['circle_phrase'] or '—'}</code>\n\n"
+        f"<b>Анкета:</b>\n"
+        f"Имя: {data['name']}\n"
+        f"Возраст: {data['age']}\n"
+        f"Город: {data['city']}\n"
+        f"Диагноз: {data['diagnosis']}\n"
+        f"Описание: {data['about']}"
+    )
+    sent = await to_admin(ctx.bot, TOPIC_APPS, profile_text, reply_markup=kb_app_review(uid))
+    if sent:
+        db_save_admin_msg(sent.message_id, uid, "profile")
+        if u["circle_file_id"]:
             try:
-                lvl_str = parts[2].lower()
-                if lvl_str in ("низкий", "1"): lvl = 1
-                elif lvl_str in ("средний", "2"): lvl = 2
-                elif lvl_str in ("высокий", "3"): lvl = 3
-                else: lvl = int(lvl_str)
-                days = int(parts[3])
-            except:
-                return await msg.reply_text("❌ Формат: <tg_id> вип <уровень> <дней>")
-            until = (datetime.utcnow() + timedelta(days=days)).isoformat()
-            lim = VIP_LIMITS.get(lvl, VIP_LIMITS[1])
-            await upsert_user(target, vip_level=lvl, vip_until=until, chars_limit=lim["chars"], likes_left=lim["likes"])
-            await safe(ctx.bot.send_message, target, f"👑 <b>Тебе выдан VIP {lvl} на {days} дней!</b> 🍁", parse_mode=ParseMode.HTML)
-            await msg.reply_text(f"✅ VIP {lvl} на {days} дн. выдан {target}")
+                await ctx.bot.send_video_note(
+                    ADMIN_CHAT_ID, u["circle_file_id"],
+                    reply_to_message_id=sent.message_id, **_tk(TOPIC_APPS),
+                )
+            except Exception:
+                pass
 
-        elif kind in ("доп", "dop"):
-            if len(parts) < 3: return await msg.reply_text("❌ Формат: <tg_id> доп <тип> [дней]")
-            dop = parts[2].lower()
-            days = int(parts[3]) if len(parts) > 3 else 0
-            await _grant_dop(target, dop, days)
-            await safe(ctx.bot.send_message, target, f"🎁 <b>Тебе выдан доп: {dop}</b> 🍁", parse_mode=ParseMode.HTML)
-            await msg.reply_text(f"✅ Доп {dop} выдан {target}")
+
+async def handle_support(update, ctx):
+    msg = update.effective_message
+    uid = update.effective_user.id
+    ctx.user_data.pop("support_mode", None)
+    await msg.reply_text("✅ Тикет создан. Ожидайте ответа.", reply_markup=kb_main(uid == ADMIN_ID))
+    text = f"🆘 <b>Тикет</b>\nОт: <code>{uid}</code> @{update.effective_user.username or '-'}\n\n{msg.text}"
+    sent = await to_admin(ctx.bot, TOPIC_TICKETS, text, reply_markup=kb_ticket(uid))
+    if sent:
+        db_save_admin_msg(sent.message_id, uid, "ticket")
+
+
+async def private_message(update, ctx):
+    msg = update.effective_message
+    if not msg or msg.chat.type != "private":
+        return
+    uid = update.effective_user.id
+    u = db_get_user(uid, update.effective_user)
+    if u["banned"]:
+        raise ApplicationHandlerStop
+
+    if uid == ADMIN_ID and ctx.user_data.get("admin_input"):
+        await handle_admin_input(update, ctx)
+        raise ApplicationHandlerStop
+
+    if msg.contact:
+        await handle_contact(update, ctx)
+        raise ApplicationHandlerStop
+
+    if ctx.user_data.get("support_mode") and msg.text:
+        await handle_support(update, ctx)
+        raise ApplicationHandlerStop
+
+    if not u["circle_file_id"]:
+        if msg.video_note:
+            await handle_circle(update, ctx, u)
         else:
-            await msg.reply_text("❌ Тип должен быть 'вип' или 'доп'.")
+            await msg.reply_text(
+                "❌ Вы прислали не видео-кружок.\nЗапишите именно <b>видео-кружок</b> (круглое видео).",
+                parse_mode=ParseMode.HTML,
+            )
+        raise ApplicationHandlerStop
 
-    elif action == "takebyid":
-        parts = text.split()
-        if len(parts) != 2: return await msg.reply_text("❌ Формат: <tg_id> <тип>")
-        try:
-            target = int(parts[0])
-        except:
-            return await msg.reply_text("❌ tg_id должен быть числом.")
-        kind = parts[1].lower()
-        target_user = await get_user(target)
-        if not target_user:
-            return await msg.reply_text("❌ Пользователь не найден.")
-
-        if kind in ("вип", "vip"):
-            await upsert_user(target, vip_level=0, vip_until=None, chars_limit=300, likes_left=20)
-            await safe(ctx.bot.send_message, target, "⚠️ Твой VIP был снят администратором.")
-            await msg.reply_text(f"✅ VIP снят у {target}")
+    p = db_get_profile(uid)
+    if not p or p["rejected"]:
+        if msg.text:
+            await handle_profile(update, ctx, u, msg.text)
         else:
-            await _take_dop(target, kind)
-            await safe(ctx.bot.send_message, target, "⚠️ Один из твоих допов был снят администратором.")
-            await msg.reply_text(f"✅ Доп {kind} снят у {target}")
+            await msg.reply_text("❌ Отправьте анкету текстом по шаблону.")
+        raise ApplicationHandlerStop
 
-async def post_init(app: Application):
-    await app.bot.set_my_commands([])
-    await app.bot.delete_my_commands()
-    await db_init()
+    if msg.text:
+        await msg.reply_text(
+            "🍁 Используйте меню:",
+            reply_markup=kb_main(uid == ADMIN_ID),
+        )
+    raise ApplicationHandlerStop
+
+
+async def anon_relay(update, ctx):
+    msg = update.effective_message
+    if not msg or msg.chat.type != "private":
+        return
+    if not (msg.text or msg.photo or msg.video or msg.video_note
+            or msg.voice or msg.document or msg.sticker or msg.animation):
+        return
+    uid = update.effective_user.id
+    partner = get_partner(uid)
+    if not partner:
+        return
+    if anon_time_left(uid) <= 0:
+        with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+            conn.execute(
+                "DELETE FROM anon_pairs WHERE (user_a=? AND user_b=?) OR (user_a=? AND user_b=?)",
+                (uid, partner, partner, uid),
+            )
+            conn.commit()
+        price = db_get_price("anon")
+        await safe_send(
+            ctx.bot, uid,
+            f"⏰ Время вышло. Купите доступ на {ANON_PAID_DAYS} дн. за {price}₽ у {MANAGER}.",
+        )
+        await safe_send(ctx.bot, partner, "🛑 Собеседник отключился.")
+        raise ApplicationHandlerStop
+    try:
+        await ctx.bot.copy_message(partner, msg.chat.id, msg.message_id)
+    except Exception:
+        pass
+    raise ApplicationHandlerStop
+
+
+async def admin_chat_handler(update, ctx):
+    msg = update.effective_message
+    if not msg or msg.chat.id != ADMIN_CHAT_ID:
+        return
+    if msg.from_user.id != ADMIN_ID and not await is_admin(ctx.bot, msg.from_user.id):
+        return
+
+    if ctx.user_data.get("ticket_reply_to") and msg.text:
+        uid = ctx.user_data.pop("ticket_reply_to")
+        await safe_send(ctx.bot, uid, f"📩 <b>Ответ поддержки:</b>\n\n{msg.text}")
+        await msg.reply_text("✅ Отправлено.")
+        raise ApplicationHandlerStop
+
+    if msg.reply_to_message:
+        target = db_get_admin_msg(msg.reply_to_message.message_id)
+        if not target:
+            return
+        uid, mtype = target
+        if mtype == "profile":
+            db_set(uid, circle_file_id=None)
+            with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+                conn.execute("DELETE FROM profiles WHERE user_id=?", (uid,))
+                conn.commit()
+            phrase = " · ".join(random.sample(CODE_WORDS, 3))
+            db_set(uid, circle_phrase=phrase)
+            await safe_send(
+                ctx.bot, uid,
+                "✏️ Администратор попросил переписать анкету.\n\n"
+                "🎥 Запишите видео-кружок с фразой:\n\n"
+                f"<code>{phrase}</code>",
+            )
+            await msg.reply_text(
+                f"✏️ Запрос на перепись отправлен пользователю <code>{uid}</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+            raise ApplicationHandlerStop
+
+
+async def handle_admin_input(update, ctx):
+    msg = update.effective_message
+    action = ctx.user_data.pop("admin_input", None)
+    if not action:
+        return
+    kind, *args = action
+    try:
+        if kind == "ban":
+            uid = int(msg.text.strip())
+            db_set(uid, banned=1, ban_reason="Бан администратором")
+            await msg.reply_text(f"🔨 <code>{uid}</code> забанен.", parse_mode=ParseMode.HTML)
+            await safe_send(ctx.bot, uid,
+                            f"🚫 Забанены администратором.\nРазбан за {UNBAN_PRICE}₽ у {MANAGER}")
+        elif kind == "unban":
+            uid = int(msg.text.strip())
+            db_set(uid, banned=0, ban_reason=None)
+            await msg.reply_text(f"🔓 <code>{uid}</code> разбанен.", parse_mode=ParseMode.HTML)
+            await safe_send(ctx.bot, uid, "✅ Вы разбанены.")
+        elif kind == "give_vip_uid":
+            uid = int(msg.text.strip())
+            ctx.user_data.pop("admin_input", None)
+            ctx.user_data["admin_pending_vip_uid"] = uid
+            await msg.reply_text(
+                "Введите уровень VIP (1, 2 или 3):",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("1", callback_data=f"admin:vip_lvl:{uid}:1"),
+                     InlineKeyboardButton("2", callback_data=f"admin:vip_lvl:{uid}:2"),
+                     InlineKeyboardButton("3", callback_data=f"admin:vip_lvl:{uid}:3")],
+                    [InlineKeyboardButton("◀️ Отмена", callback_data="admin:main")],
+                ]),
+            )
+        elif kind == "give_vip_days":
+            uid, lvl = args
+            days = int(msg.text.strip())
+            if days == 0:
+                db_set(uid, vip=lvl, vip_until=None)
+                await safe_send(ctx.bot, uid, f"🎁 VIP {lvl} выдан навсегда!")
+            else:
+                u = db_get_user(uid)
+                db_set(uid, vip=lvl, vip_until=add_days(u["vip_until"], days))
+                await safe_send(ctx.bot, uid, f"🎁 VIP {lvl} выдан на {days} дн.!")
+            await msg.reply_text(f"✅ VIP {lvl} → <code>{uid}</code>", parse_mode=ParseMode.HTML,
+                                 reply_markup=kb_admin())
+        elif kind == "take_vip":
+            uid = int(msg.text.strip())
+            db_set(uid, vip=0, vip_until=None)
+            await safe_send(ctx.bot, uid, "⚠️ VIP снят администратором.")
+            await msg.reply_text(f"🗑 VIP снят с <code>{uid}</code>.", parse_mode=ParseMode.HTML,
+                                 reply_markup=kb_admin())
+        elif kind == "give_anon":
+            parts = msg.text.strip().split()
+            uid = int(parts[0])
+            days = int(parts[1]) if len(parts) > 1 else ANON_PAID_DAYS
+            if days == 0:
+                until = (datetime.now(timezone.utc) + timedelta(days=36500)).isoformat()
+                db_set(uid, anon_until=until)
+                await safe_send(ctx.bot, uid, "🎁 Анон-доступ выдан навсегда!")
+            else:
+                u = db_get_user(uid)
+                db_set(uid, anon_until=add_days(u["anon_until"], days))
+                await safe_send(ctx.bot, uid, f"🎁 Анон-доступ выдан на {days} дн.!")
+            await msg.reply_text(f"✅ Анон → <code>{uid}</code>", parse_mode=ParseMode.HTML,
+                                 reply_markup=kb_admin())
+        elif kind == "take_anon":
+            uid = int(msg.text.strip())
+            db_set(uid, anon_until=None)
+            await safe_send(ctx.bot, uid, "⚠️ Анон-доступ снят.")
+            await msg.reply_text(f"🗑 Анон снят с <code>{uid}</code>.", parse_mode=ParseMode.HTML,
+                                 reply_markup=kb_admin())
+        elif kind == "price":
+            key = args[0]
+            val = int(msg.text.strip())
+            db_set_price(key, val)
+            await msg.reply_text(f"✅ {key} = {val}₽", reply_markup=kb_admin_prices())
+    except Exception:
+        await msg.reply_text("❌ Ошибка формата.", reply_markup=kb_admin())
+
+
+async def cb_agree_yes(update, ctx):
+    q = update.callback_query
+    uid = q.from_user.id
+    db_set(uid, agreed=1)
+    await q.message.edit_text("✅ Соглашение принято.")
+    await ask_phone(q.message)
+    await q.answer()
+
+
+async def cb_agree_no(update, ctx):
+    q = update.callback_query
+    uid = q.from_user.id
+    db_set(uid, banned=1, ban_reason="Отказ от соглашения")
+    await q.message.edit_text("❌ Вы отказались от соглашения.")
+    await notify_user(ctx.bot, uid, BAN_ON_REFUSE)
+    await to_admin(ctx.bot, TOPIC_SYSTEM, f"🚫 Отказ: <code>{uid}</code>")
+    await q.answer()
+
+
+async def cb_menu_main(update, ctx):
+    q = update.callback_query
+    uid = q.from_user.id
+    ctx.user_data.pop("support_mode", None)
+    await q.message.edit_text(
+        "🍁 <b>Главное меню</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_main(uid == ADMIN_ID),
+    )
+    await q.answer()
+
+
+async def cb_menu_profiles(update, ctx):
+    q = update.callback_query
+    uid = q.from_user.id
+    await ensure_daily_likes(uid)
+    await show_profile(q, uid)
+    await q.answer()
+
+
+async def show_profile(q, uid):
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        conn.row_factory = sqlite3.Row
+        r = conn.execute("""
+            SELECT p.* FROM profiles p
+            WHERE p.approved=1 AND p.user_id != ?
+              AND p.user_id NOT IN (SELECT to_id FROM likes WHERE from_id=?)
+            ORDER BY RANDOM() LIMIT 1
+        """, (uid, uid)).fetchone()
+    if not r:
+        await q.message.edit_text("🍁 Анкеты закончились.", reply_markup=kb_back())
+        return
+    p = dict(r)
+    u = db_get_user(uid)
+    text = (
+        f"<b>🍁 Анкета</b>\n\n"
+        f"Имя: {p['name']}\nВозраст: {p['age']}\nГород: {p['city']}\n"
+        f"Диагноз: {p['diagnosis']}\nО себе: {p['about']}"
+    )
+    rows = [[
+        InlineKeyboardButton("❤️ Лайк", callback_data=f"like:{p['user_id']}"),
+        InlineKeyboardButton("➡️ Дальше", callback_data=f"skip:{p['user_id']}"),
+        InlineKeyboardButton("🚨", callback_data=f"prof_report:{p['user_id']}"),
+    ]]
+    if u["vip"] == 3:
+        rows.insert(1, [InlineKeyboardButton("⬅️ Назад", callback_data=f"back:{p['user_id']}")])
+    rows.append([InlineKeyboardButton("◀️ В меню", callback_data="menu:main")])
+    await q.message.edit_text(text, parse_mode=ParseMode.HTML,
+                              reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def cb_like(update, ctx):
+    q = update.callback_query
+    uid = q.from_user.id
+    target = int(q.data.split(":")[1])
+    await ensure_daily_likes(uid)
+    u = db_get_user(uid)
+    if u["likes_left"] <= 0:
+        await q.answer()
+        return await q.message.edit_text(
+            "⚠️ <b>Лимит лайков на сегодня исчерпан.</b>\n"
+            "Хотите больше? Купите VIP в магазине.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_back("menu:profiles"),
+        )
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        conn.execute("INSERT OR IGNORE INTO likes(from_id,to_id,ts) VALUES(?,?,?)",
+                     (uid, target, datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+        mutual = conn.execute("SELECT 1 FROM likes WHERE from_id=? AND to_id=?",
+                              (target, uid)).fetchone()
+    if u["vip"] != 3:
+        db_set(uid, likes_left=u["likes_left"] - 1)
+
+    if mutual:
+        me = db_get_profile(uid)
+        other = db_get_profile(target)
+        u1 = db_get_user(uid)
+        u2 = db_get_user(target)
+        text_me = (
+            f"🎉 <b>Взаимный лайк!</b>\n\n"
+            f"<b>Мэтч:</b>\n{other['name']}, {other['age']}, {other['city']}\n"
+            f"@{u2['username'] or '—'}\n\n"
+            f"Вы: {me['name']}, {me['age']}, {me['city']}\n@{u1['username'] or '—'}"
+        )
+        text_other = (
+            f"🎉 <b>Взаимный лайк!</b>\n\n"
+            f"<b>Мэтч:</b>\n{me['name']}, {me['age']}, {me['city']}\n"
+            f"@{u1['username'] or '—'}\n\n"
+            f"Вы: {other['name']}, {other['age']}, {other['city']}\n@{u2['username'] or '—'}"
+        )
+        await safe_send(ctx.bot, uid, text_me)
+        await safe_send(ctx.bot, target, text_other)
+    else:
+        await safe_send(ctx.bot, target, "❤️ Кто-то лайкнул вашу анкету. Возможно, взаимно!")
+
+    await q.answer("❤️ Лайк отправлен")
+    await show_profile(q, uid)
+
+
+async def cb_skip(update, ctx):
+    q = update.callback_query
+    await q.answer()
+    await show_profile(q, q.from_user.id)
+
+
+async def cb_back_profile(update, ctx):
+    q = update.callback_query
+    uid = q.from_user.id
+    u = db_get_user(uid)
+    if u["vip"] != 3:
+        return await q.answer("Доступно только с VIP 3", show_alert=True)
+    target = int(q.data.split(":")[1])
+    p = db_get_profile(target)
+    if not p:
+        return await q.answer("Анкета недоступна", show_alert=True)
+    text = (
+        f"<b>🍁 Анкета</b>\n\n"
+        f"Имя: {p['name']}\nВозраст: {p['age']}\nГород: {p['city']}\n"
+        f"Диагноз: {p['diagnosis']}\nО себе: {p['about']}"
+    )
+    rows = [[
+        InlineKeyboardButton("❤️ Лайк", callback_data=f"like:{target}"),
+        InlineKeyboardButton("➡️ Дальше", callback_data=f"skip:{target}"),
+        InlineKeyboardButton("🚨", callback_data=f"prof_report:{target}"),
+    ], [InlineKeyboardButton("◀️ В меню", callback_data="menu:main")]]
+    await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+    await q.answer()
+
+
+async def cb_prof_report(update, ctx):
+    q = update.callback_query
+    reporter = q.from_user.id
+    target = int(q.data.split(":")[1])
+    p = db_get_profile(target)
+    if not p:
+        return await q.answer("Анкета недоступна", show_alert=True)
+    text = (
+        f"🚨 <b>Жалоба на анкету</b>\n"
+        f"От: <code>{reporter}</code> @{q.from_user.username or '-'}\n"
+        f"На: <code>{target}</code>\n\n"
+        f"<b>Анкета:</b>\n"
+        f"Имя: {p['name']}\nВозраст: {p['age']}\nГород: {p['city']}\n"
+        f"Диагноз: {p['diagnosis']}\nО себе: {p['about']}"
+    )
+    await to_admin(ctx.bot, TOPIC_REPORTS, text, reply_markup=kb_report(target))
+    await q.answer("🚨 Жалоба отправлена", show_alert=True)
+
+
+async def cb_menu_profile(update, ctx):
+    q = update.callback_query
+    uid = q.from_user.id
+    u = db_get_user(uid, q.from_user)
+    p = db_get_profile(uid)
+    text = (
+        f"👤 <b>Ваш профиль</b>\n\n"
+        f"ID: <code>{uid}</code>\n"
+        f"VIP: {vip_label(u['vip'])}\n"
+        f"Лайков сегодня: {u['likes_left']}\n"
+        f"Лимит символов: {'∞' if vip_char_limit(u['vip']) >= 10**9 else vip_char_limit(u['vip'])}\n"
+    )
+    if u["anon_until"]:
+        text += f"Анон-доступ до: {u['anon_until'][:16]}\n"
+    if p:
+        text += (
+            f"\n<b>Анкета:</b>\nИмя: {p['name']}\nВозраст: {p['age']}\n"
+            f"Город: {p['city']}\nДиагноз: {p['diagnosis']}\nО себе: {p['about']}"
+        )
+    await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_profile_view())
+    await q.answer()
+
+
+async def cb_profile_edit(update, ctx):
+    q = update.callback_query
+    uid = q.from_user.id
+    db_set(uid, circle_file_id=None)
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        conn.execute("DELETE FROM profiles WHERE user_id=?", (uid,))
+        conn.commit()
+    await q.message.edit_text("✏️ Анкета сброшена.", reply_markup=kb_back())
+    await start_circle(q.message, ctx, uid)
+    await q.answer()
+
+
+async def cb_menu_shop(update, ctx):
+    q = update.callback_query
+    await q.message.edit_text(
+        "🛒 <b>Магазин «Клёнчик»</b>\n\nВыберите товар:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_shop(),
+    )
+    await q.answer()
+
+
+async def cb_shop_item(update, ctx):
+    q = update.callback_query
+    key = q.data.split(":")[1]
+    if key == "vip1":
+        price = db_get_price("vip1")
+        text = (
+            f"🍁 <b>VIP 1 — Низкий</b>\nЦена: <b>{price} ₽</b> / мес\n\n"
+            "• Анкета показывается чаще.\n"
+            "• Лимит анкеты 500 символов.\n"
+            "• 40 лайков в сутки."
+        )
+    elif key == "vip2":
+        price = db_get_price("vip2")
+        text = (
+            f"🍁 <b>VIP 2 — Средний</b>\nЦена: <b>{price} ₽</b> / мес\n\n"
+            "• Анкета показывается ещё чаще.\n"
+            "• Лимит анкеты 800 символов.\n"
+            "• 60 лайков в сутки."
+        )
+    elif key == "vip3":
+        price = db_get_price("vip3")
+        text = (
+            f"🍁 <b>VIP 3 — Высокий</b>\nЦена: <b>{price} ₽</b> / мес\n\n"
+            "• Анкета показывается чаще всех.\n"
+            "• Безлимит анкеты.\n"
+            "• Безлимит лайков.\n"
+            "• Кнопка «⬅️ Назад» к предыдущей анкете."
+        )
+    else:
+        price = db_get_price("anon")
+        text = (
+            f"💬 <b>Доступ в анонимный чат</b>\nЦена: <b>{price} ₽</b>\n\n"
+            f"• +{ANON_PAID_DAYS} дн. анонимного чата сверх бесплатного часа."
+        )
+    rows = [
+        [InlineKeyboardButton("💳 Купить", callback_data=f"shop:buy:{key}")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="menu:shop")],
+    ]
+    await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+    await q.answer()
+
+
+async def cb_shop_buy(update, ctx):
+    q = update.callback_query
+    key = q.data.split(":")[2]
+    uid = q.from_user.id
+    price = db_get_price(key)
+    names = {"vip1": "VIP 1", "vip2": "VIP 2", "vip3": "VIP 3", "anon": "Доступ в анон-чат"}
+    text = (
+        f"💳 <b>Оплата</b>\n\n"
+        f"Товар: {names.get(key, key)}\n"
+        f"Сумма: <b>{price} ₽</b>\n\n"
+        f"Напишите менеджеру: {MANAGER}\n"
+        f"Пришлите ему ваш ID: <code>{uid}</code>\n\n"
+        "После оплаты менеджер выдаст товар."
+    )
+    await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_back("menu:shop"))
+    await q.answer()
+
+
+async def cb_menu_anon(update, ctx):
+    q = update.callback_query
+    uid = q.from_user.id
+    left = anon_time_left(uid)
+    if left <= 0:
+        price = db_get_price("anon")
+        text = (
+            f"⏰ <b>Бесплатный час израсходован.</b>\n\n"
+            f"Купите доступ на {ANON_PAID_DAYS} дн. — <b>{price} ₽</b>.\n"
+            f"Менеджер: {MANAGER}\nВаш ID: <code>{uid}</code>"
+        )
+    else:
+        mins = left // 60
+        text = (
+            f"💬 <b>Анонимный чат</b>\n\n"
+            f"⏳ Осталось: <b>{mins} мин.</b>\n\n"
+            "🔎 Найти собеседника — подберём пару.\n"
+            "🛑 Стоп — завершить диалог."
+        )
+    await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_anon())
+    await q.answer()
+
+
+async def cb_anon_find(update, ctx):
+    q = update.callback_query
+    uid = q.from_user.id
+    left = anon_time_left(uid)
+    if left <= 0:
+        return await q.answer("Время вышло. Купите доступ.", show_alert=True)
+    if get_partner(uid):
+        return await q.answer("Вы уже в чате.", show_alert=True)
+
+    u = db_get_user(uid)
+    if not u["anon_until"] and not u["anon_free_used"]:
+        until = (datetime.now(timezone.utc) + timedelta(minutes=ANON_FREE_MIN)).isoformat()
+        db_set(uid, anon_until=until, anon_free_used=1)
+
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        row = conn.execute(
+            "SELECT user_id FROM anon_queue WHERE user_id != ? ORDER BY ts LIMIT 1", (uid,)
+        ).fetchone()
+        if row:
+            partner = row[0]
+            conn.execute("DELETE FROM anon_queue WHERE user_id IN (?,?)", (uid, partner))
+            conn.execute("INSERT OR REPLACE INTO anon_pairs(user_a,user_b,ts) VALUES(?,?,?)",
+                         (uid, partner, datetime.now(timezone.utc).isoformat()))
+            conn.commit()
+            await safe_send(ctx.bot, partner, "🎉 Собеседник найден!")
+            await q.message.edit_text(
+                "🎉 <b>Собеседник найден!</b>\nОбщайтесь. Стоп — для завершения.",
+                parse_mode=ParseMode.HTML, reply_markup=kb_anon(),
+            )
+        else:
+            conn.execute("INSERT OR REPLACE INTO anon_queue(user_id,ts) VALUES(?,?)",
+                         (uid, datetime.now(timezone.utc).isoformat()))
+            conn.commit()
+            await q.message.edit_text("🔎 Ищем собеседника...", reply_markup=kb_anon())
+    await q.answer()
+
+
+async def cb_anon_stop(update, ctx):
+    q = update.callback_query
+    uid = q.from_user.id
+    partner = get_partner(uid)
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        conn.execute("DELETE FROM anon_queue WHERE user_id=?", (uid,))
+        if partner:
+            conn.execute(
+                "DELETE FROM anon_pairs WHERE (user_a=? AND user_b=?) OR (user_a=? AND user_b=?)",
+                (uid, partner, partner, uid),
+            )
+        conn.commit()
+    await q.message.edit_text("🛑 Чат завершён.", reply_markup=kb_back())
+    if partner:
+        await safe_send(ctx.bot, partner, "🛑 Собеседник завершил чат.")
+    await q.answer()
+
+
+async def cb_menu_support(update, ctx):
+    q = update.callback_query
+    ctx.user_data["support_mode"] = True
+    await q.message.edit_text(
+        "🆘 <b>Поддержка</b>\n\nНапишите ваш вопрос одним сообщением.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_back(),
+    )
+    await q.answer()
+
+
+async def cb_app_accept(update, ctx):
+    q = update.callback_query
+    if not await is_admin(ctx.bot, q.from_user.id):
+        return await q.answer("Нет прав", show_alert=True)
+    uid = int(q.data.split(":")[2])
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        conn.execute("UPDATE profiles SET approved=1, rejected=0 WHERE user_id=?", (uid,))
+        conn.commit()
+    await q.message.edit_reply_markup(reply_markup=None)
+    await safe_send(ctx.bot, uid, "✅ Ваша анкета одобрена!")
+    await q.answer("Одобрено")
+
+
+async def cb_app_reject(update, ctx):
+    q = update.callback_query
+    if not await is_admin(ctx.bot, q.from_user.id):
+        return await q.answer("Нет прав", show_alert=True)
+    uid = int(q.data.split(":")[2])
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        conn.execute("UPDATE profiles SET approved=0, rejected=1 WHERE user_id=?", (uid,))
+        conn.execute("UPDATE users SET banned=1, ban_reason='Анкета отклонена' WHERE user_id=?", (uid,))
+        conn.commit()
+    await q.message.edit_reply_markup(reply_markup=None)
+    await notify_user(ctx.bot, uid, PROFILE_REJECTED)
+    await q.answer("Отклонено")
+
+
+async def cb_app_rewrite(update, ctx):
+    q = update.callback_query
+    if not await is_admin(ctx.bot, q.from_user.id):
+        return await q.answer("Нет прав", show_alert=True)
+    uid = int(q.data.split(":")[2])
+    db_set(uid, circle_file_id=None)
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        conn.execute("DELETE FROM profiles WHERE user_id=?", (uid,))
+        conn.commit()
+    phrase = " · ".join(random.sample(CODE_WORDS, 3))
+    db_set(uid, circle_phrase=phrase)
+    await q.message.edit_reply_markup(reply_markup=None)
+    await safe_send(
+        ctx.bot, uid,
+        "✏️ Администратор попросил переписать анкету.\n\n"
+        "🎥 Запишите видео-кружок с фразой:\n\n"
+        f"<code>{phrase}</code>",
+    )
+    await q.answer("Отправлено")
+
+
+async def cb_ticket_reply(update, ctx):
+    q = update.callback_query
+    if not await is_admin(ctx.bot, q.from_user.id):
+        return await q.answer("Нет прав", show_alert=True)
+    uid = int(q.data.split(":")[2])
+    ctx.user_data["ticket_reply_to"] = uid
+    await q.message.reply_text(f"✍️ Напишите ответ для <code>{uid}</code>:", parse_mode=ParseMode.HTML)
+    await q.answer()
+
+
+async def cb_report_ban(update, ctx):
+    q = update.callback_query
+    if not await is_admin(ctx.bot, q.from_user.id):
+        return await q.answer("Нет прав", show_alert=True)
+    uid = int(q.data.split(":")[2])
+    db_set(uid, banned=1, ban_reason="Жалоба")
+    await q.message.edit_reply_markup(reply_markup=None)
+    await safe_send(ctx.bot, uid, f"🚫 Забанены по жалобе.\nРазбан за {UNBAN_PRICE}₽ у {MANAGER}")
+    await q.answer("Забанен")
+
+
+async def cb_report_ignore(update, ctx):
+    q = update.callback_query
+    if not await is_admin(ctx.bot, q.from_user.id):
+        return await q.answer("Нет прав", show_alert=True)
+    await q.message.edit_reply_markup(reply_markup=None)
+    await q.answer("Игнорировано")
+
+
+async def cb_admin_main(update, ctx):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return await q.answer("Нет доступа", show_alert=True)
+    await q.message.edit_text("🛠 <b>Админ-панель</b>", parse_mode=ParseMode.HTML, reply_markup=kb_admin())
+    await q.answer()
+
+
+async def cb_admin_count(update, ctx):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return await q.answer("Нет доступа", show_alert=True)
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        total = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        active = conn.execute("SELECT COUNT(*) FROM users WHERE banned=0").fetchone()[0]
+        approved = conn.execute("SELECT COUNT(*) FROM profiles WHERE approved=1").fetchone()[0]
+    await q.message.edit_text(
+        f"👥 Всего: <b>{total}</b>\nАктивных: <b>{active}</b>\nАнкет одобрено: <b>{approved}</b>",
+        parse_mode=ParseMode.HTML, reply_markup=kb_back("admin:main"),
+    )
+    await q.answer()
+
+
+async def cb_admin_ban(update, ctx):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return await q.answer("Нет доступа", show_alert=True)
+    ctx.user_data["admin_input"] = ("ban",)
+    await q.message.edit_text("Введите ID для бана:", reply_markup=kb_back("admin:main"))
+    await q.answer()
+
+
+async def cb_admin_unban(update, ctx):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return await q.answer("Нет доступа", show_alert=True)
+    ctx.user_data["admin_input"] = ("unban",)
+    await q.message.edit_text("Введите ID для разбана:", reply_markup=kb_back("admin:main"))
+    await q.answer()
+
+
+async def cb_admin_give_vip(update, ctx):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return await q.answer("Нет доступа", show_alert=True)
+    ctx.user_data["admin_input"] = ("give_vip_uid",)
+    await q.message.edit_text("Введите ID пользователя:", reply_markup=kb_back("admin:main"))
+    await q.answer()
+
+
+async def cb_admin_vip_lvl(update, ctx):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return await q.answer("Нет доступа", show_alert=True)
+    parts = q.data.split(":")
+    uid, lvl = int(parts[2]), int(parts[3])
+    ctx.user_data.pop("admin_pending_vip_uid", None)
+    ctx.user_data["admin_input"] = ("give_vip_days", uid, lvl)
+    await q.message.edit_text(
+        f"Введите число дней для VIP {lvl} (0 = навсегда):",
+        reply_markup=kb_back("admin:main"),
+    )
+    await q.answer()
+
+
+async def cb_admin_take_vip(update, ctx):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return await q.answer("Нет доступа", show_alert=True)
+    ctx.user_data["admin_input"] = ("take_vip",)
+    await q.message.edit_text("Введите ID, чтобы снять VIP:", reply_markup=kb_back("admin:main"))
+    await q.answer()
+
+
+async def cb_admin_give_anon(update, ctx):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return await q.answer("Нет доступа", show_alert=True)
+    ctx.user_data["admin_input"] = ("give_anon",)
+    await q.message.edit_text(
+        "Введите: <code>ID дни</code> (0 = навсегда).\nПример: <code>123456789 30</code>",
+        parse_mode=ParseMode.HTML, reply_markup=kb_back("admin:main"),
+    )
+    await q.answer()
+
+
+async def cb_admin_take_anon(update, ctx):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return await q.answer("Нет доступа", show_alert=True)
+    ctx.user_data["admin_input"] = ("take_anon",)
+    await q.message.edit_text("Введите ID, чтобы снять анон:", reply_markup=kb_back("admin:main"))
+    await q.answer()
+
+
+async def cb_admin_prices(update, ctx):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return await q.answer("Нет доступа", show_alert=True)
+    await q.message.edit_text("💲 <b>Цены:</b>", parse_mode=ParseMode.HTML,
+                              reply_markup=kb_admin_prices())
+    await q.answer()
+
+
+async def cb_admin_price_set(update, ctx):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return await q.answer("Нет доступа", show_alert=True)
+    key = q.data.split(":")[2]
+    ctx.user_data["admin_input"] = ("price", key)
+    await q.message.edit_text(f"Новая цена для <b>{key}</b>:", parse_mode=ParseMode.HTML,
+                              reply_markup=kb_back("admin:prices"))
+    await q.answer()
+
+
+async def cb_admin_users(update, ctx):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        return await q.answer("Нет доступа", show_alert=True)
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT user_id, username, full_name, vip, banned "
+            "FROM users ORDER BY created_at DESC LIMIT 50"
+        ).fetchall()
+    lines = ["📋 <b>Последние 50 юзеров:</b>", ""]
+    for r in rows:
+        st = "🚫" if r["banned"] else "✅"
+        if r["username"]:
+            who = f"@{r['username']}"
+        else:
+            who = r["full_name"] or "без имени"
+        lines.append(f"{st} <code>{r['user_id']}</code> · {who} · VIP{r['vip']}")
+    await q.message.edit_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_back("admin:main"),
+    )
+    await q.answer()
+
+
+async def cb_noop(update, ctx):
+    await update.callback_query.answer()
+
+
+async def error_handler(update, ctx):
+    pass
+
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("stop", cmd_stop))
-    app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE, ban_mw), group=-500)
+    app.add_handler(CallbackQueryHandler(ban_cb_mw), group=-500)
 
-    app.add_handler(MessageHandler(filters.Chat(ADMIN_CHAT_ID) & filters.REPLY & filters.TEXT, on_admin_reply))
-    
-    app.add_handler(MessageHandler(filters.CONTACT, on_contact))
-    app.add_handler(MessageHandler(filters.VIDEO_NOTE, on_video))
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_text))
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.CONTACT & ~filters.VIDEO_NOTE & ~filters.TEXT, on_media)) 
-    
-    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^/start"), cmd_start), group=-450)
 
-    log.info("Бот Кленчик запущен на PTB.")
-    app.run_polling(drop_pending_updates=True)
+    app.add_handler(MessageHandler(filters.Chat(ADMIN_CHAT_ID), admin_chat_handler), group=-400)
+
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, anon_relay), group=-300)
+
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE, private_message), group=0)
+
+    app.add_handler(CallbackQueryHandler(cb_agree_yes, pattern=r"^agree:yes$"))
+    app.add_handler(CallbackQueryHandler(cb_agree_no, pattern=r"^agree:no$"))
+
+    app.add_handler(CallbackQueryHandler(cb_menu_main, pattern=r"^menu:main$"))
+    app.add_handler(CallbackQueryHandler(cb_menu_profiles, pattern=r"^menu:profiles$"))
+    app.add_handler(CallbackQueryHandler(cb_menu_profile, pattern=r"^menu:profile$"))
+    app.add_handler(CallbackQueryHandler(cb_menu_shop, pattern=r"^menu:shop$"))
+    app.add_handler(CallbackQueryHandler(cb_menu_anon, pattern=r"^menu:anon$"))
+    app.add_handler(CallbackQueryHandler(cb_menu_support, pattern=r"^menu:support$"))
+
+    app.add_handler(CallbackQueryHandler(cb_like, pattern=r"^like:"))
+    app.add_handler(CallbackQueryHandler(cb_skip, pattern=r"^skip:"))
+    app.add_handler(CallbackQueryHandler(cb_back_profile, pattern=r"^back:"))
+    app.add_handler(CallbackQueryHandler(cb_prof_report, pattern=r"^prof_report:"))
+
+    app.add_handler(CallbackQueryHandler(cb_profile_edit, pattern=r"^profile:edit$"))
+
+    app.add_handler(CallbackQueryHandler(cb_anon_find, pattern=r"^anon:find$"))
+    app.add_handler(CallbackQueryHandler(cb_anon_stop, pattern=r"^anon:stop$"))
+
+    app.add_handler(CallbackQueryHandler(cb_shop_item, pattern=r"^shop:(vip1|vip2|vip3|anon)$"))
+    app.add_handler(CallbackQueryHandler(cb_shop_buy, pattern=r"^shop:buy:"))
+
+    app.add_handler(CallbackQueryHandler(cb_app_accept, pattern=r"^app:accept:"))
+    app.add_handler(CallbackQueryHandler(cb_app_reject, pattern=r"^app:reject:"))
+    app.add_handler(CallbackQueryHandler(cb_app_rewrite, pattern=r"^app:rewrite:"))
+
+    app.add_handler(CallbackQueryHandler(cb_ticket_reply, pattern=r"^ticket:reply:"))
+    app.add_handler(CallbackQueryHandler(cb_report_ban, pattern=r"^report:ban:"))
+    app.add_handler(CallbackQueryHandler(cb_report_ignore, pattern=r"^report:ignore:"))
+
+    app.add_handler(CallbackQueryHandler(cb_admin_main, pattern=r"^admin:main$"))
+    app.add_handler(CallbackQueryHandler(cb_admin_count, pattern=r"^admin:count$"))
+    app.add_handler(CallbackQueryHandler(cb_admin_ban, pattern=r"^admin:ban$"))
+    app.add_handler(CallbackQueryHandler(cb_admin_unban, pattern=r"^admin:unban$"))
+    app.add_handler(CallbackQueryHandler(cb_admin_give_vip, pattern=r"^admin:give_vip$"))
+    app.add_handler(CallbackQueryHandler(cb_admin_vip_lvl, pattern=r"^admin:vip_lvl:"))
+    app.add_handler(CallbackQueryHandler(cb_admin_take_vip, pattern=r"^admin:take_vip$"))
+    app.add_handler(CallbackQueryHandler(cb_admin_give_anon, pattern=r"^admin:give_anon$"))
+    app.add_handler(CallbackQueryHandler(cb_admin_take_anon, pattern=r"^admin:take_anon$"))
+    app.add_handler(CallbackQueryHandler(cb_admin_prices, pattern=r"^admin:prices$"))
+    app.add_handler(CallbackQueryHandler(cb_admin_price_set, pattern=r"^admin:price_set:"))
+    app.add_handler(CallbackQueryHandler(cb_admin_users, pattern=r"^admin:users$"))
+
+    app.add_handler(CallbackQueryHandler(cb_noop, pattern=r"^noop$"))
+
+    app.add_error_handler(error_handler)
+
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
