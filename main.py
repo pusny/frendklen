@@ -27,7 +27,12 @@ ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 SUPERADMIN_ID = int(os.getenv("SUPERADMIN_ID", "0"))
 PAYMENT_LINK = os.getenv("PAYMENT_LINK", "")
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "@support")
-DB_PATH = os.getenv("DB_PATH", "data/data.db")
+
+DATA_DIR = os.getenv("DATA_DIR", "")
+DB_PATH = os.getenv("DB_PATH", "data.db")
+
+if DATA_DIR and not os.path.isabs(DB_PATH):
+    DB_PATH = os.path.join(DATA_DIR, DB_PATH)
 
 os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
 
@@ -314,11 +319,14 @@ async def send_to_admin_chat(bot: Bot, prof: dict, u: dict):
          InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm:reject:{prof['tg_id']}")],
         [InlineKeyboardButton(text="✏️ Переделать", callback_data=f"adm:rework:{prof['tg_id']}")],
     ])
-    if prof.get("video"):
-        await bot.send_video_note(ADMIN_CHAT_ID, prof["video"])
-    if prof.get("photo1"):
-        await bot.send_photo(ADMIN_CHAT_ID, prof["photo1"])
-    await bot.send_message(ADMIN_CHAT_ID, text, reply_markup=kb, parse_mode="HTML")
+    try:
+        if prof.get("video"):
+            await bot.send_video_note(ADMIN_CHAT_ID, prof["video"])
+        if prof.get("photo1"):
+            await bot.send_photo(ADMIN_CHAT_ID, prof["photo1"])
+        await bot.send_message(ADMIN_CHAT_ID, text, reply_markup=kb, parse_mode="HTML")
+    except Exception as e:
+        log.error(f"Не удалось отправить в админ-чат: {e}")
 
 @router.callback_query(F.data.startswith("adm:"))
 async def adm_verify(cb: CallbackQuery, state: FSMContext):
