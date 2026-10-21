@@ -67,6 +67,20 @@ VIP_LIMITS = {
 
 VERIFY_WORDS = ["КЛЕН", "ЛИСТ", "БУКЕТ", "ОСЕНЬ", "ВЕТЕР", "ЗАКАТ"]
 
+STATUS_RU = {
+    "new": "🥚 Новичок",
+    "awaiting_contact": "📱 Ждёт номер",
+    "awaiting_video": "🎥 Ждёт видео",
+    "awaiting_form": "📝 Заполняет анкету",
+    "pending_review": "⏳ На модерации",
+    "active": "✅ Активен",
+    "banned": "🚫 Забанен",
+    "rejected": "❌ Отклонён",
+}
+
+def get_status_ru(status: str) -> str:
+    return STATUS_RU.get(status, status)
+
 logging.basicConfig(
     format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
     level=logging.INFO
@@ -74,7 +88,6 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("klenchik")
 
-# --- СОСТОЯНИЯ АНОНИМНОГО ЧАТА ---
 WAITING_USERS = set()
 ACTIVE_CHATS = {}
 
@@ -89,8 +102,6 @@ def get_payment_contact() -> str:
     if not pl.startswith("@"):
         return "@" + pl
     return pl
-
-# ------------------ БАЗА ДАННЫХ ------------------
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(
@@ -186,8 +197,6 @@ async def refresh_likes(tg_id: int):
     if not reset or datetime.fromisoformat(reset) < datetime.utcnow() - timedelta(days=1):
         await upsert_user(tg_id, likes_left=lim["likes"], likes_reset_at=now_iso())
 
-# ------------------ ХЕЛПЕРЫ ------------------
-
 async def safe(func, *args, **kwargs):
     try:
         return await func(*args, **kwargs)
@@ -216,7 +225,6 @@ def main_menu_kb(user_id: int = 0):
     ]
     if user_id == SUPERADMIN_ID:
         kb_list.append([InlineKeyboardButton("🛠 Админ-панель", callback_data="a:main")])
-        
     return InlineKeyboardMarkup(kb_list)
 
 def incognito_menu_kb():
@@ -231,7 +239,16 @@ def incog_active_kb():
     ])
 
 async def send_main_menu(bot, chat_id):
-    await safe(bot.send_message, chat_id=chat_id, text="🏠 <b>Главное меню</b>\nВыберите раздел:", reply_markup=main_menu_kb(chat_id), parse_mode=ParseMode.HTML)
+    text = (
+        "🍁 <b>Главное меню Кленчика</b>\n\n"
+        "Выбери, что хочешь сделать:\n\n"
+        "🗂 <b>Смотреть анкеты</b> — листай анкеты других пользователей и ставь лайки\n"
+        "💬 <b>Чат инкогнито</b> — анонимное общение со случайным человеком\n"
+        "🛒 <b>Магазин</b> — VIP-статусы и дополнения для анкеты\n"
+        "🆘 <b>Поддержка</b> — напиши нам, если что-то не работает\n"
+        "👤 <b>Моя анкета</b> — посмотреть свою анкету и VIP-статус"
+    )
+    await safe(bot.send_message, chat_id=chat_id, text=text, reply_markup=main_menu_kb(chat_id), parse_mode=ParseMode.HTML)
 
 def admin_main_kb():
     return InlineKeyboardMarkup([
@@ -244,8 +261,6 @@ def admin_main_kb():
         [InlineKeyboardButton("⬅️ В главное меню", callback_data="menu:back")]
     ])
 
-# ------------------ КОМАНДЫ ------------------
-
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user: return
@@ -254,7 +269,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         partner = ACTIVE_CHATS.pop(user.id, None)
         if partner:
             ACTIVE_CHATS.pop(partner, None)
-            await safe(ctx.bot.send_message, partner, "🛑 Собеседник покинул чат. Вы можете найти нового.", reply_markup=incognito_menu_kb())
+            await safe(ctx.bot.send_message, partner, "🛑 Собеседник покинул чат. Ты можешь найти нового.", reply_markup=incognito_menu_kb())
         WAITING_USERS.discard(user.id)
 
     await db_exec("DELETE FROM admin_states WHERE tg_id=?", (user.id,))
@@ -263,34 +278,42 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = await upsert_user(user.id, username=user.username or "")
 
     if u["banned"]:
-        return await update.message.reply_text(f"🚫 Доступ к боту заблокирован.\nПричина: {u['ban_reason'] or 'не указана'}")
+        return await update.message.reply_text(f"🚫 <b>Доступ к боту заблокирован.</b>\n\nПричина: {u['ban_reason'] or 'не указана'}\n\nЕсли считаешь это ошибкой — напиши администратору.", parse_mode=ParseMode.HTML)
 
     if u["status"] == "active":
         return await send_main_menu(ctx.bot, user.id)
 
     if u["status"] == "pending_review":
-        return await update.message.reply_text("⏳ Ваша анкета на модерации. Ожидайте.")
+        return await update.message.reply_text(
+            "⏳ <b>Анкета на модерации</b> 🍁\n\n"
+            "Твоя анкета уже у модератора. Обычно проверка занимает немного времени.\n\n"
+            "<i>Мы напишем тебе, как только примем решение. Просто подожди немного.</i>",
+            parse_mode=ParseMode.HTML
+        )
 
     if u["status"] == "new":
         await upsert_user(user.id, status="awaiting_contact")
         kb = ReplyKeyboardMarkup([[KeyboardButton("📱 Поделиться номером", request_contact=True)]], resize_keyboard=True, one_time_keyboard=True)
         return await update.message.reply_text(
-            "🌸 Добро пожаловать в <b>Кленчик</b>!\n\n"
-            "Для регистрации поделитесь номером телефона — кнопка ниже.\n"
-            "🔒 Номер остаётся внутри чата с ботом, никуда не передаётся, используется только для защиты от мультиаккаунтов и подтверждения возраста.",
+            "🍁 <b>Добро пожаловать в Кленчик!</b> 🍁\n\n"
+            "Здесь ты можешь найти друзей, пообщаться в анонимном чате и просто провести время в уютной осенней атмосфере.\n\n"
+            "📋 <b>Шаг 1 из 3: Знакомство</b>\n"
+            "Пожалуйста, поделись своим номером телефона — нажми на кнопку ниже.\n\n"
+            "🔒 <i>Твой номер останется внутри бота и никуда не передаётся. Он нужен только для защиты от мультиаккаунтов и проверки возраста.</i>",
             reply_markup=kb, parse_mode=ParseMode.HTML
         )
 
     if u["status"] == "awaiting_contact":
         kb = ReplyKeyboardMarkup([[KeyboardButton("📱 Поделиться номером", request_contact=True)]], resize_keyboard=True, one_time_keyboard=True)
-        return await update.message.reply_text("Пожалуйста, поделитесь номером с помощью кнопки ниже.", reply_markup=kb)
+        return await update.message.reply_text("🍁 Пожалуйста, поделись номером с помощью кнопки ниже.", reply_markup=kb)
 
     if u["status"] == "awaiting_video":
         words = u["verify_words"] or "—"
         return await update.message.reply_text(
-            "📹 <b>Шаг 2: Подтверждение личности</b>\n\n"
-            f"Запишите <b>видео-кружок</b>, чётко произнеся: <b>{words}</b>\n"
-            "У вас 3 попытки.",
+            "🎥 <b>Шаг 2 из 3: Видео-кружок</b> 🍁\n\n"
+            "Чтобы убедиться, что ты реальный человек, запиши <b>видео-кружок</b> (нажми на скрепку 📎 → «Видео-кружок»).\n\n"
+            f"🎥 В кружке нужно чётко произнести вслух: <b>{words}</b>\n\n"
+            "⚠️ <i>У тебя 3 попытки. Если пришлёшь не кружок — попытка сгорит. После 3 промахов бот заблокирует доступ.</i>",
             reply_markup=ReplyKeyboardRemove(), parse_mode=ParseMode.HTML
         )
 
@@ -302,10 +325,13 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "4. Город:\n5. Диагноз:\n6. Зачем пришёл/ла:\n7. Хобби:</code>"
         )
         return await update.message.reply_text(
-            f"📝 <b>Шаг 3: Анкета</b>\nСкопируйте шаблон тапом ниже, заполните и отправьте одним сообщением.\n\n{template}\n\n"
-            f"⚠️ Лимит символов: <b>{chars}</b>.\n"
-            "📸 При желании прикрепите 1 фото к сообщению.\n"
-            "Возраст от 12 лет.",
+            f"📝 <b>Шаг 3 из 3: Анкета</b> 🍁\n\n"
+            "Отлично, видео принято! Остался последний шаг — заполни анкету о себе.\n\n"
+            "Скопируй шаблон ниже (тапни по нему), заполни все поля и отправь <b>одним сообщением</b>:\n\n"
+            f"{template}\n\n"
+            f"⚠️ <b>Лимит символов:</b> {chars}\n"
+            "📸 Можешь прикрепить одно фото к сообщению — анкеты с фото получают больше лайков!\n"
+            "🔞 Возраст от 12 лет.",
             parse_mode=ParseMode.HTML, reply_markup=ReplyKeyboardRemove()
         )
 
@@ -314,25 +340,23 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     
     if user_id in WAITING_USERS:
         WAITING_USERS.remove(user_id)
-        return await update.message.reply_text("🛑 Поиск собеседника отменен.", reply_markup=incognito_menu_kb())
+        return await update.message.reply_text("🛑 Поиск собеседника отменён.", reply_markup=incognito_menu_kb())
         
     if user_id in ACTIVE_CHATS:
         partner_id = ACTIVE_CHATS.pop(user_id)
         ACTIVE_CHATS.pop(partner_id, None)
         
-        await update.message.reply_text("🛑 Вы покинули анонимный чат.", reply_markup=incognito_menu_kb())
-        await safe(ctx.bot.send_message, partner_id, "🛑 Собеседник покинул чат. Вы можете найти нового.", reply_markup=incognito_menu_kb())
+        await update.message.reply_text("🛑 Ты покинул анонимный чат.", reply_markup=incognito_menu_kb())
+        await safe(ctx.bot.send_message, partner_id, "🛑 Собеседник покинул чат. Ты можешь найти нового.", reply_markup=incognito_menu_kb())
         return
 
     await update.message.reply_text("Вы сейчас не в чате и не в поиске.")
-
-# ------------------ РЕГИСТРАЦИЯ ------------------
 
 async def on_contact(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or not msg.contact: return
     if msg.contact.user_id != msg.from_user.id:
-        return await msg.reply_text("Пожалуйста, используйте кнопку ниже.")
+        return await msg.reply_text("🍁 Пожалуйста, используй кнопку ниже.")
 
     words = random.sample(VERIFY_WORDS, 3)
     words_str = ", ".join(words)
@@ -340,11 +364,13 @@ async def on_contact(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await upsert_user(msg.from_user.id, phone=msg.contact.phone_number, status="awaiting_video", verify_words=words_str, attempts_left=3)
 
     await msg.reply_text(
-        "✅ Номер принят.\n\n"
-        "📹 <b>Шаг 2: Видео-кружок</b>\n\n"
-        "Запишите кружок (скрепка -> «Видео-кружок»), лицо должно быть чётко видно.\n\n"
-        f"Произнесите вслух: <b>{words_str}</b>\n\n"
-        "<i>У вас 3 попытки.</i>",
+        "✅ Спасибо! Номер принят. 🍁\n\n"
+        "🎥 <b>Шаг 2 из 3: Подтверждение личности</b>\n\n"
+        "Запиши <b>видео-кружок</b> (нажми на скрепку 📎 → «Видео-кружок»).\n\n"
+        "🎥 В кружке должно быть:\n"
+        "• Лицо чётко видно, без размытия и бликов\n"
+        f"• Ты произносишь вслух: <b>{words_str}</b>\n\n"
+        "⚠️ <i>У тебя 3 попытки. Если пришлёшь не кружок — попытка сгорит.</i>",
         parse_mode=ParseMode.HTML, reply_markup=ReplyKeyboardRemove()
     )
 
@@ -359,31 +385,39 @@ async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     u = await get_user(user_id)
-    if not u or u["status"] != "awaiting_video": return
+    if not u: return
+    if u["banned"]: return
 
-    await upsert_user(user_id, status="awaiting_form")
+    if u["status"] == "awaiting_video":
+        await upsert_user(user_id, status="awaiting_form")
 
-    await safe(
-        db_exec,
-        "INSERT OR IGNORE INTO profiles(tg_id, video, approved, created_at) VALUES(?,?,0,?)",
-        (user_id, msg.video_note.file_id, now_iso())
-    )
+        await safe(
+            db_exec,
+            "INSERT OR IGNORE INTO profiles(tg_id, video, approved, created_at) VALUES(?,?,0,?)",
+            (user_id, msg.video_note.file_id, now_iso())
+        )
 
-    lim = await vip_limits(u)
-    chars = max(u["chars_limit"] or 300, lim["chars"])
-    template = (
-        "<code>1. Имя/Псевдоним:\n2. Возраст:\n3. Местоимения:\n"
-        "4. Город:\n5. Диагноз:\n6. Зачем пришёл/ла:\n7. Хобби:</code>"
-    )
+        lim = await vip_limits(u)
+        chars = max(u["chars_limit"] or 300, lim["chars"])
+        template = (
+            "<code>1. Имя/Псевдоним:\n2. Возраст:\n3. Местоимения:\n"
+            "4. Город:\n5. Диагноз:\n6. Зачем пришёл/ла:\n7. Хобби:</code>"
+        )
 
-    await msg.reply_text("✅ Видео принято.")
-    await msg.reply_text(
-        f"📝 <b>Шаг 3: Анкета</b>\nСкопируйте шаблон тапом ниже, заполните и отправьте одним сообщением.\n\n{template}\n\n"
-        f"⚠️ Лимит символов: <b>{chars}</b>.\n"
-        "📸 При желании прикрепите 1 фото к сообщению.\n"
-        "Возраст от 12 лет.",
-        parse_mode=ParseMode.HTML
-    )
+        await msg.reply_text("✅ Видео принято! 🍁")
+        return await msg.reply_text(
+            f"📝 <b>Шаг 3 из 3: Анкета</b> 🍁\n\n"
+            "Отлично, остался последний шаг — заполни анкету о себе.\n\n"
+            "Скопируй шаблон ниже (тапни по нему), заполни все поля и отправь <b>одним сообщением</b>:\n\n"
+            f"{template}\n\n"
+            f"⚠️ <b>Лимит символов:</b> {chars}\n"
+            "📸 Можешь прикрепить одно фото к сообщению — анкеты с фото получают больше лайков!\n"
+            "🔞 Возраст от 12 лет.",
+            parse_mode=ParseMode.HTML
+        )
+        
+    if u["status"] == "active":
+        await send_main_menu(ctx.bot, user_id)
 
 def parse_form(text: str):
     lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
@@ -428,6 +462,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     u = await get_user(user_id)
     if not u: return
+    if u["banned"]: return
 
     if u["pending_action"] == "support":
         await db_exec("UPDATE users SET pending_action=NULL WHERE tg_id=?", (user_id,))
@@ -439,14 +474,14 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"👤 @{esc(u['username']) if u['username'] else 'без username'}\n"
             f"🆔 <code>{user_id}</code>\n\n"
             f"💬 <b>Сообщение:</b>\n{esc(text)}\n\n"
-            f"<i>Чтобы ответить, зажмите это сообщение и выберите «Ответить».</i>",
+            f"<i>Чтобы ответить, зажми это сообщение и выбери «Ответить».</i>",
             parse_mode=ParseMode.HTML
         )
         
         if sent_msg:
             await db_exec("INSERT INTO support_tickets(admin_msg_id, user_id, created_at) VALUES(?,?,?)", (sent_msg.message_id, user_id, now_iso()))
             
-        return await msg.reply_text("✅ Обращение отправлено. Ожидайте ответа.")
+        return await msg.reply_text("✅ Обращение отправлено! 🍁\n\n<i>Администратор ответит тебе прямо здесь, как только освободится.</i>", parse_mode=ParseMode.HTML)
 
     if u["status"] == "awaiting_video":
         left = (u["attempts_left"] or 1) - 1
@@ -454,18 +489,23 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await upsert_user(user_id, banned=1, ban_reason="Не прошёл верификацию", status="banned")
             return await msg.reply_text("🚫 Вы исчерпали попытки. Доступ заблокирован.")
         await upsert_user(user_id, attempts_left=left)
-        return await msg.reply_text(f"❌ Вы прислали не видео-кружок. Осталось попыток: {left}. После этого доступ будет заблокирован.")
+        return await msg.reply_text(f"❌ Ты прислал не видео-кружок. Осталось попыток: <b>{left}</b>. После этого доступ будет заблокирован.", parse_mode=ParseMode.HTML)
 
     if u["status"] == "awaiting_form":
         data = parse_form(text)
         if not data:
-            return await msg.reply_text("❌ Анкета заполнена не по форме. Отправьте точно по шаблону:\n\n<code>1. Имя/Псевдоним:\n2. Возраст:\n3. Местоимения:\n4. Город:\n5. Диагноз:\n6. Зачем пришёл/ла:\n7. Хобби:</code>", parse_mode=ParseMode.HTML)
+            return await msg.reply_text(
+                "❌ <b>Анкета заполнена не по форме.</b>\n\n"
+                "Скопируй шаблон ниже, заполни все поля и отправь <b>одним сообщением</b>:\n\n"
+                "<code>1. Имя/Псевдоним:\n2. Возраст:\n3. Местоимения:\n4. Город:\n5. Диагноз:\n6. Зачем пришёл/ла:\n7. Хобби:</code>",
+                parse_mode=ParseMode.HTML
+            )
 
         lim = await vip_limits(u)
         chars_limit = max(u["chars_limit"] or 300, lim["chars"])
         for k in ["reason", "hobby", "diagnosis"]:
             if len(data[k]) > chars_limit:
-                return await msg.reply_text(f"❌ Поле «{k}» превышает лимит {chars_limit} символов.")
+                return await msg.reply_text(f"❌ Поле «{k}» превышает лимит {chars_limit} символов. Сократи, пожалуйста.")
 
         photo1 = msg.photo[-1].file_id if msg.photo else None
 
@@ -476,9 +516,20 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         prof = await db_exec("SELECT * FROM profiles WHERE tg_id=?", (user_id,), fetch="one")
 
         await upsert_user(user_id, status="pending_review")
-        await msg.reply_text("📨 Анкета отправлена на проверку. Ожидайте.")
+        await msg.reply_text(
+            "📨 <b>Анкета отправлена на модерацию!</b> 🍁\n\n"
+            "Спасибо за регистрацию! Твоя анкета сейчас на проверке у модератора.\n\n"
+            "🕒 <i>Обычно это занимает немного времени. Мы напишем тебе, как только примем решение — жди сообщение от бота.</i>\n\n"
+            "Пока можешь отдохнуть. Скоро увидимся! 🍁",
+            parse_mode=ParseMode.HTML
+        )
         await send_to_admin_chat(ctx.bot, prof, u)
         return
+        
+    if u["status"] == "active":
+        await send_main_menu(ctx.bot, user_id)
+    elif u["status"] == "pending_review":
+        await msg.reply_text("⏳ Твоя анкета всё ещё на модерации. Пожалуйста, подожди немного 🍁")
 
 async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -492,20 +543,25 @@ async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         
     if msg.photo and msg.caption:
         await on_text(update, ctx)
+        return
+        
+    u = await get_user(user_id)
+    if u and u["status"] == "active":
+        await send_main_menu(ctx.bot, user_id)
 
 async def send_to_admin_chat(bot, prof, u):
     text = (
-        f"🆕 <b>Новая анкета</b>\n"
-        f"tg_id: <code>{prof['tg_id']}</code>\n"
-        f"📞 {u['phone']}\n"
-        f"🗣 <b>Слова:</b> {u['verify_words']}\n\n"
+        f"🆕 <b>Новая анкета на модерацию</b>\n\n"
+        f"👤 <b>Пользователь:</b> <code>{prof['tg_id']}</code>\n"
+        f"📞 <b>Телефон:</b> {u['phone']}\n"
+        f"🗣 <b>Слова для кружка:</b> {u['verify_words']}\n\n"
         f"<b>Анкета:</b>\n"
         f"👤 <b>{prof['name']}</b>, {prof['age']}\n"
-        f"🏳️‍🌈 {prof['pronouns']}\n"
-        f"📍 {prof['city']}\n"
-        f"🩺 {prof['diagnosis']}\n"
-        f"💭 {prof['reason']}\n"
-        f"🎨 {prof['hobby']}"
+        f"🏳️‍🌈 Местоимения: {prof['pronouns']}\n"
+        f"📍 Город: {prof['city']}\n"
+        f"🩺 Диагноз: {prof['diagnosis']}\n"
+        f"💭 Зачем пришёл/ла: {prof['reason']}\n"
+        f"🎨 Хобби: {prof['hobby']}"
     )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Принять", callback_data=f"adm:approve:{prof['tg_id']}"),
@@ -518,8 +574,6 @@ async def send_to_admin_chat(bot, prof, u):
         await bot.send_message(ADMIN_CHAT_ID, text, reply_markup=kb, parse_mode=ParseMode.HTML)
     except Exception as e:
         log.error(f"Err admin chat: {e}")
-
-# ------------------ ОБРАБОТКА РЕПЛАЕВ АДМИНА ------------------
 
 async def on_admin_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -536,13 +590,9 @@ async def on_admin_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             await msg.reply_text("❌ Не удалось отправить (пользователь заблокировал бота?).")
 
-# ------------------ АДМИН ------------------
-
 async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != SUPERADMIN_ID: return
     await update.message.reply_text("🛠 <b>Админ-панель</b>", reply_markup=admin_main_kb(), parse_mode=ParseMode.HTML)
-
-# ------------------ CALLBACK ------------------
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -558,17 +608,17 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if action == "approve":
             await db_exec("UPDATE profiles SET approved=1 WHERE tg_id=?", (tid,))
             await db_exec("UPDATE users SET status='active', banned=0 WHERE tg_id=?", (tid,))
-            await safe(ctx.bot.send_message, tid, "🎉 Ваша анкета одобрена! Добро пожаловать.", reply_markup=main_menu_kb(tid))
+            await safe(ctx.bot.send_message, tid, "🎉 <b>Твоя анкета одобрена!</b> 🍁\n\nДобро пожаловать в Кленчик. Теперь тебе доступны все функции.\n\nВыбирай раздел ниже 👇", reply_markup=main_menu_kb(tid), parse_mode=ParseMode.HTML)
             await query.edit_message_reply_markup(reply_markup=None)
 
         elif action == "reject":
             await db_exec("UPDATE users SET status='banned', banned=1, ban_reason='Отклонено' WHERE tg_id=?", (tid,))
-            await safe(ctx.bot.send_message, tid, "🚫 Ваша анкета отклонена. Доступ закрыт.")
+            await safe(ctx.bot.send_message, tid, "🚫 <b>Твоя анкета отклонена.</b>\n\nК сожалению, модератор отклонил твою заявку. Доступ к боту заблокирован.", parse_mode=ParseMode.HTML)
             await query.edit_message_reply_markup(reply_markup=None)
 
         elif action == "rework":
             await db_exec("INSERT OR REPLACE INTO admin_states(tg_id, action, target_id) VALUES(?,?,?)", (user_id, "rework", tid))
-            await query.message.reply_text(f"Введите комментарий для {tid}:")
+            await query.message.reply_text(f"Введи комментарий для {tid} (что именно нужно исправить):")
         return
 
     if data.startswith("a:"):
@@ -588,7 +638,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if len(users) == 10: nav.append(InlineKeyboardButton("➡️", callback_data=f"a:users:{offset+10}"))
             if nav: rows.append(nav)
             rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="a:back")])
-            await query.edit_message_text(f"Пользователи ({offset+1}-{offset+len(users)}):", reply_markup=InlineKeyboardMarkup(rows))
+            await query.edit_message_text(f"👥 Пользователи ({offset+1}-{offset+len(users)}):", reply_markup=InlineKeyboardMarkup(rows))
 
         elif act == "u":
             tid = int(parts[2])
@@ -646,28 +696,28 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elif act == "ban":
             tid = int(parts[2])
             await db_exec("INSERT OR REPLACE INTO admin_states(tg_id, action, target_id) VALUES(?,?,?)", (user_id, "ban", tid))
-            await query.message.reply_text("Введите причину бана:")
+            await query.message.reply_text("Введи причину бана:")
 
         elif act == "unban":
             tid = int(parts[2])
             await upsert_user(tid, banned=0, status="active")
-            await query.message.reply_text("Разбанен.")
+            await query.message.reply_text("✅ Разбанен.")
 
         elif act == "givevip":
             tid = int(parts[2])
             await db_exec("INSERT OR REPLACE INTO admin_states(tg_id, action, target_id) VALUES(?,?,?)", (user_id, "vip", tid))
-            await query.message.reply_text("Введите уровень (1/2/3) и дней, например: 2 30")
+            await query.message.reply_text("Введи уровень (1/2/3) и дней, например: 2 30")
 
         elif act == "takevip":
             tid = int(parts[2])
             await upsert_user(tid, vip_level=0, vip_until=None, chars_limit=300, likes_left=20)
-            await safe(ctx.bot.send_message, tid, "⚠️ Ваш VIP был снят администратором.")
+            await safe(ctx.bot.send_message, tid, "⚠️ Твой VIP был снят администратором.")
             await query.message.reply_text("✅ VIP снят.")
 
         elif act == "givedop":
             tid = int(parts[2])
             await db_exec("INSERT OR REPLACE INTO admin_states(tg_id, action, target_id) VALUES(?,?,?)", (user_id, "dop", tid))
-            await query.message.reply_text("Введите доп (символы / лайки / возврат / фото / инкогнито) и дней через пробел:")
+            await query.message.reply_text("Введи доп (символы / лайки / возврат / фото / инкогнито) и дней через пробел:")
 
         elif act == "takedop":
             tid = int(parts[2])
@@ -705,18 +755,21 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    # --- ПОЛЬЗОВАТЕЛЬСКИЕ ---
     u = await get_user(user_id)
     if not u: return
 
     if data == "menu:back":
         WAITING_USERS.discard(user_id)
-        await query.message.edit_text("🏠 <b>Главное меню</b>", reply_markup=main_menu_kb(user_id), parse_mode=ParseMode.HTML)
+        await query.message.edit_text(
+            "🍁 <b>Главное меню Кленчика</b>\n\nВыбери, что хочешь сделать:",
+            reply_markup=main_menu_kb(user_id),
+            parse_mode=ParseMode.HTML
+        )
 
     elif data == "menu:ankety":
         await refresh_likes(user_id)
         u = await get_user(user_id)
-        if u["likes_left"] <= 0: return await query.answer("Лимит лайков исчерпан.", show_alert=True)
+        if u["likes_left"] <= 0: return await query.answer("❤️ Лимит лайков исчерпан. Купи доп в магазине.", show_alert=True)
         await show_next_profile(query, u, 0)
 
     elif data.startswith("skip:"):
@@ -730,10 +783,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         target_id = int(data.split(":")[1])
         has_prev = (u["vip_level"] == 3) or (u["has_prev_addon"] == 1)
         if not has_prev:
-            return await query.answer("Доступно только с VIP Высоким или допом.", show_alert=True)
+            return await query.answer("⏪ Доступно только с VIP Высоким или допом «Возврат анкеты».", show_alert=True)
         prof = await db_exec("SELECT * FROM profiles WHERE tg_id=?", (target_id,), fetch="one")
         if not prof:
-            return await query.answer("Анкета недоступна.", show_alert=True)
+            return await query.answer("Анкета больше недоступна.", show_alert=True)
         text = f"👤 <b>{prof['name']}</b>, {prof['age']} ({prof['pronouns']})\n📍 {prof['city']}\n\n🩺 {prof['diagnosis']}\n💭 {prof['reason']}\n🎨 {prof['hobby']}"
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("❤️ Лайк", callback_data=f"like:{prof['tg_id']}"),
@@ -749,7 +802,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         target = int(data.split(":")[1])
         await refresh_likes(user_id)
         u = await get_user(user_id)
-        if u["likes_left"] <= 0: return await query.answer("Лимит исчерпан.", show_alert=True)
+        if u["likes_left"] <= 0: return await query.answer("❤️ Лимит лайков исчерпан.", show_alert=True)
         await upsert_user(user_id, likes_left=u["likes_left"] - 1)
         await db_exec("INSERT INTO likes(from_tg, to_tg, created_at) VALUES(?,?,?)", (user_id, target, now_iso()))
 
@@ -763,8 +816,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             t_display = f"@{esc(t_un)}" if t_un else f'<a href="tg://user?id={target}">Написать в ЛС</a>'
             c_display = f"@{esc(c_un)}" if c_un else f'<a href="tg://user?id={user_id}">Написать в ЛС</a>'
             
-            await safe(ctx.bot.send_message, target, f"💞 <b>Взаимный лайк!</b>\n\nВаша анкета понравилась пользователю.\nКонтакт для связи: {c_display}", parse_mode=ParseMode.HTML)
-            await safe(ctx.bot.send_message, user_id, f"💞 <b>Взаимный лайк!</b>\n\nВаша анкета понравилась пользователю.\nКонтакт для связи: {t_display}", parse_mode=ParseMode.HTML)
+            await safe(ctx.bot.send_message, target, f"💞 <b>Взаимная симпатия!</b> 🍁\n\nКому-то понравилась твоя анкета, и вы совпали!\nКонтакт для связи: {c_display}\n\n<i>Напиши первым, не стесняйся 🍁</i>", parse_mode=ParseMode.HTML)
+            await safe(ctx.bot.send_message, user_id, f"💞 <b>Взаимная симпатия!</b> 🍁\n\nКому-то понравилась твоя анкета, и вы совпали!\nКонтакт для связи: {t_display}\n\n<i>Напиши первым, не стесняйся 🍁</i>", parse_mode=ParseMode.HTML)
             
         await query.answer("❤️ Лайк отправлен")
         await show_next_profile(query, u, 0)
@@ -772,23 +825,27 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif data == "menu:shop":
         rows = [[InlineKeyboardButton(text=v[1], callback_data=f"buyinfo:{k}")] for k, v in PRICES.items()]
         rows.append([InlineKeyboardButton("⬅️ Меню", callback_data="menu:back")])
-        await query.message.edit_text("🛒 <b>Магазин</b>\nВыберите товар:", reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+        await query.message.edit_text(
+            "🛒 <b>Магазин Кленчика</b> 🍁\n\nВыбери товар для подробностей:",
+            reply_markup=InlineKeyboardMarkup(rows),
+            parse_mode=ParseMode.HTML
+        )
 
     elif data.startswith("buyinfo:"):
         key = data.split(":")[1]
         price, name = PRICES[key]
         desc = {
-            "vip_low": "40 лайков, 600 символов, приоритет.",
-            "vip_mid": "60 лайков, 800 символов, 2 фото.",
-            "vip_high": "Безлимит лайков, 1000 символов, видео, возврат.",
-            "chars_600": "Лимит символов до 600.",
-            "unlimited_likes": "Безлимит лайков на день.",
-            "prev_anketa": "Возврат предыдущей анкеты.",
-            "second_media": "Второе фото/видео.",
-            "incognito_day": "Доступ к анонимному чату на 1 день."
+            "vip_low": "🟢 <b>40 лайков в день</b>\n• Лимит символов: 600\n• Приоритет в выдаче анкет: средний",
+            "vip_mid": "🟡 <b>60 лайков в день</b>\n• Лимит символов: 800\n• Возможность загрузить 2 фото\n• Приоритет в выдаче анкет: повышенный",
+            "vip_high": "🔴 <b>Безлимитные лайки</b>\n• Лимит символов: 1000\n• 2 фото + видео (15 сек)\n• Возврат к предыдущей анкете\n• Приоритет в выдаче анкет: максимальный",
+            "chars_600": "📝 Разблокирует возможность писать более длинные тексты в анкете (до 600 символов вместо 300).",
+            "unlimited_likes": "❤️ Позволяет ставить безлимитное количество лайков на 1 день.",
+            "prev_anketa": "⏪ Если ты случайно скипнул интересного человека, эта функция позволит вернуться к его анкете.",
+            "second_media": "📸 Позволяет прикрепить дополнительное фото (или видео) к твоей анкете.",
+            "incognito_day": "🕵️ Открывает доступ к анонимному чату со случайным собеседником на 1 день."
         }
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("💳 Купить", callback_data=f"buy:{key}")], [InlineKeyboardButton("⬅️ Назад", callback_data="menu:shop")]])
-        await query.message.edit_text(f"<b>{name}</b> — {price}₽\n\n{desc.get(key, '')}", reply_markup=kb, parse_mode=ParseMode.HTML)
+        await query.message.edit_text(f"{desc.get(key, '')}\n\n💰 Цена: <b>{price}₽</b>", reply_markup=kb, parse_mode=ParseMode.HTML)
 
     elif data.startswith("buy:"):
         key = data.split(":")[1]
@@ -796,9 +853,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         contact = get_payment_contact()
         
         await query.message.edit_text(
-            f"💳 <b>Оплата:</b> {name} — <b>{price}₽</b>\n\n"
-            f"Для покупки напишите нашему менеджеру: <b>{esc(contact)}</b>\n\n"
-            f"<i>После оплаты администратор вручную выдаст вам доступ.</i>",
+            f"💳 <b>Оплата</b> 🍁\n\n"
+            f"Товар: <b>{name}</b>\n"
+            f"Стоимость: <b>{price}₽</b>\n\n"
+            f"Чтобы купить, напиши нашему менеджеру: <b>{esc(contact)}</b>\n\n"
+            f"<i>После оплаты менеджер вручную выдаст тебе доступ. Это займёт немного времени.</i>",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="menu:shop")]]),
             parse_mode=ParseMode.HTML
         )
@@ -818,15 +877,16 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         has_access = until and datetime.fromisoformat(until) > datetime.utcnow()
         
         if not has_access:
-            return await query.answer("У вас нет доступа. Купите в магазине за 30р/день.", show_alert=True)
+            return await query.answer("🕵️ У тебя нет доступа. Купи в магазине за 30₽/день.", show_alert=True)
             
         if user_id in ACTIVE_CHATS:
-            return await query.answer("Вы уже в чате. Напишите /stop чтобы выйти.", show_alert=True)
+            return await query.answer("Ты уже в чате. Напиши /stop, чтобы выйти.", show_alert=True)
             
         await query.message.edit_text(
-            "💬 <b>Анонимный чат</b>\n\n"
-            "Здесь вы можете анонимно пообщаться со случайным человеком.\n"
-            "Нажмите «Искать собеседника», чтобы начать.",
+            "💬 <b>Анонимный чат</b> 🍁\n\n"
+            "Здесь ты можешь анонимно пообщаться со случайным человеком. Никто не увидит твоё имя или фото — только сообщения.\n\n"
+            "Нажми «Искать собеседника», и мы найдём тебе пару.\n\n"
+            "⚠️ <i>Чтобы выйти из чата, напиши /stop или нажми «Остановить чат».</i>",
             reply_markup=incognito_menu_kb(),
             parse_mode=ParseMode.HTML
         )
@@ -835,28 +895,29 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         until = u["incognito_until"]
         has_access = until and datetime.fromisoformat(until) > datetime.utcnow()
         if not has_access:
-            return await query.answer("Доступ истек.", show_alert=True)
+            return await query.answer("Доступ истёк.", show_alert=True)
 
         if user_id in ACTIVE_CHATS:
-            return await query.answer("Вы уже в чате. Напишите /stop.", show_alert=True)
+            return await query.answer("Ты уже в чате. Напиши /stop.", show_alert=True)
             
         if user_id in WAITING_USERS:
-            return await query.answer("Вы уже в поиске. Нажмите /stop.", show_alert=True)
+            return await query.answer("Ты уже в поиске. Нажми /stop.", show_alert=True)
 
         if WAITING_USERS:
             partner_id = WAITING_USERS.pop()
             ACTIVE_CHATS[user_id] = partner_id
             ACTIVE_CHATS[partner_id] = user_id
 
-            await safe(query.bot.send_message, user_id, "✅ <b>Собеседник найден!</b>\n\nВы общаетесь анонимно. Отправьте сообщение.\nЧтобы выйти, нажмите /stop.", reply_markup=incog_active_kb(), parse_mode=ParseMode.HTML)
-            await safe(query.bot.send_message, partner_id, "✅ <b>Собеседник найден!</b>\n\nВы общаетесь анонимно. Отправьте сообщение.\nЧтобы выйти, нажмите /stop.", reply_markup=incog_active_kb(), parse_mode=ParseMode.HTML)
+            msg_pair = "✅ <b>Собеседник найден!</b> 🍁\n\nТы общаешься анонимно. Отправь сообщение.\nЧтобы выйти, нажми /stop."
+            await safe(query.bot.send_message, user_id, msg_pair, reply_markup=incog_active_kb(), parse_mode=ParseMode.HTML)
+            await safe(query.bot.send_message, partner_id, msg_pair, reply_markup=incog_active_kb(), parse_mode=ParseMode.HTML)
             await query.message.delete()
         else:
             WAITING_USERS.add(user_id)
             await query.message.edit_text(
-                "🔍 <b>Ищем собеседника...</b>\n\n"
-                "Пожалуйста, подождите. Как только кто-то зайдет, вы сразу начнете общение.\n"
-                "Чтобы отменить поиск, нажмите /stop.",
+                "🔍 <b>Ищем собеседника...</b> 🍁\n\n"
+                "Пожалуйста, подожди. Как только кто-то зайдёт, вы сразу начнёте общение.\n\n"
+                "Чтобы отменить поиск, напиши /stop или нажми кнопку ниже.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Отменить поиск", callback_data="incog:stop")]]),
                 parse_mode=ParseMode.HTML
             )
@@ -868,16 +929,17 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             partner_id = ACTIVE_CHATS.pop(user_id)
             ACTIVE_CHATS.pop(partner_id, None)
             
-            await query.message.edit_text("🛑 Вы покинули чат.", reply_markup=incognito_menu_kb())
-            await safe(query.bot.send_message, partner_id, "🛑 Собеседник покинул чат. Вы можете найти нового.", reply_markup=incognito_menu_kb())
+            await query.message.edit_text("🛑 Ты покинул чат.", reply_markup=incognito_menu_kb())
+            await safe(query.bot.send_message, partner_id, "🛑 Собеседник покинул чат. Ты можешь найти нового.", reply_markup=incognito_menu_kb())
         else:
-            await query.message.edit_text("🛑 Поиск отменен.", reply_markup=incognito_menu_kb())
+            await query.message.edit_text("🛑 Поиск отменён.", reply_markup=incognito_menu_kb())
 
     elif data == "menu:support":
         await db_exec("UPDATE users SET pending_action='support' WHERE tg_id=?", (user_id,))
         await query.message.edit_text(
-            "🆘 <b>Поддержка</b>\n\n"
-            "Напишите ваш вопрос одним сообщением, и администрация ответит вам прямо здесь.",
+            "🆘 <b>Поддержка</b> 🍁\n\n"
+            "Есть вопрос или проблема? Напиши свой вопрос <b>одним сообщением</b>, и администратор ответит тебе прямо здесь.\n\n"
+            "<i>Отвечаем быстро, если мы онлайн 🍁</i>",
             parse_mode=ParseMode.HTML
         )
 
@@ -886,7 +948,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not prof:
             return await query.answer("Анкета не найдена.", show_alert=True)
         text = (
-            f"👤 <b>Моя анкета</b>\n\n"
+            f"👤 <b>Моя анкета</b> 🍁\n\n"
             f"<b>{prof['name']}</b>, {prof['age']} ({prof['pronouns']})\n"
             f"📍 {prof['city']}\n"
             f"🩺 {prof['diagnosis']}\n"
@@ -894,7 +956,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🎨 {prof['hobby']}\n\n"
             f"👑 <b>VIP:</b> {u['vip_level']} (до {u['vip_until'] or '—'})\n"
             f"❤️ <b>Лайков:</b> {u['likes_left']}\n"
-            f"⚙️ <b>Статус:</b> {u['status']}"
+            f"⚙️ <b>Статус:</b> {get_status_ru(u['status'])}"
         )
         await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Меню", callback_data="menu:back")]]), parse_mode=ParseMode.HTML)
 
@@ -912,13 +974,13 @@ async def show_next_profile(query, u, offset):
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В меню", callback_data="menu:back")]])
         if u["prev_anketa_id"] and has_prev:
             kb.inline_keyboard.insert(0, [InlineKeyboardButton("⏪ Вернуть пропущенную", callback_data=f"prev:{u['prev_anketa_id']}")])
-        return await query.message.edit_text("Больше анкет нет.", reply_markup=kb)
+        return await query.message.edit_text("🍁 На данный момент анкет больше нет.", reply_markup=kb)
 
-    text = f"👤 <b>{prof['name']}</b>, {prof['age']} ({prof['pronouns']})\n📍 {prof['city']}\n\n🩺 {prof['diagnosis']}\n💭 {prof['reason']}\n🎨 {prof['hobby']}"
+    text = f"👤 <b>{prof['name']}</b>, {prof['age']} ({prof['pronouns']})\n📍 {prof['city']}\n\n🩺 <b>Диагноз:</b> {prof['diagnosis']}\n💭 <b>Зачем пришёл/ла:</b> {prof['reason']}\n🎨 <b>Хобби:</b> {prof['hobby']}"
 
     kb_list = [
         [InlineKeyboardButton("❤️ Лайк", callback_data=f"like:{prof['tg_id']}"),
-         InlineKeyboardButton("➡️ Скип", callback_data=f"skip:{offset+1}:{prof['tg_id']}")],
+         InlineKeyboardButton("➡️ Пропустить", callback_data=f"skip:{offset+1}:{prof['tg_id']}")],
         [InlineKeyboardButton("⬅️ В меню", callback_data="menu:back")]
     ]
     if u["prev_anketa_id"] and has_prev:
@@ -986,19 +1048,19 @@ async def handle_admin_input(msg, ctx, state_row):
     if action == "rework":
         await db_exec("UPDATE profiles SET approved=0 WHERE tg_id=?", (tid,))
         await db_exec("UPDATE users SET status='awaiting_form' WHERE tg_id=?", (tid,))
-        await safe(ctx.bot.send_message, tid, f"✏️ Вашу анкету нужно переделать.\nКомментарий: {text}\n\nОтправьте /start заново.")
-        await msg.reply_text("Отправлено.")
+        await safe(ctx.bot.send_message, tid, f"✏️ <b>Твою анкету нужно переделать.</b>\n\n💬 <b>Комментарий модератора:</b>\n{text}\n\nОтправь /start, чтобы заполнить анкету заново.", parse_mode=ParseMode.HTML)
+        await msg.reply_text("✅ Комментарий отправлен.")
 
     elif action == "ban":
         await upsert_user(tid, banned=1, ban_reason=text, status="banned")
-        await safe(ctx.bot.send_message, tid, f"🚫 Доступ закрыт. Причина: {text}")
-        await msg.reply_text("Забанен.")
+        await safe(ctx.bot.send_message, tid, f"🚫 <b>Доступ закрыт.</b>\n\nПричина: {text}", parse_mode=ParseMode.HTML)
+        await msg.reply_text("🚫 Пользователь забанен.")
 
     elif action == "delprof":
         await db_exec("DELETE FROM profiles WHERE tg_id=?", (tid,))
         await db_exec("UPDATE users SET status='rejected' WHERE tg_id=?", (tid,))
-        await safe(ctx.bot.send_message, tid, f"🗑 Анкета удалена. Причина: {text}")
-        await msg.reply_text("Удалено.")
+        await safe(ctx.bot.send_message, tid, f"🗑 <b>Твоя анкета удалена модератором.</b>\n\nПричина: {text}", parse_mode=ParseMode.HTML)
+        await msg.reply_text("🗑 Анкета удалена.")
 
     elif action == "vip":
         try:
@@ -1006,35 +1068,35 @@ async def handle_admin_input(msg, ctx, state_row):
             until = (datetime.utcnow() + timedelta(days=days)).isoformat()
             lim = VIP_LIMITS.get(lvl, VIP_LIMITS[1])
             await upsert_user(tid, vip_level=lvl, vip_until=until, chars_limit=lim["chars"], likes_left=lim["likes"])
-            await safe(ctx.bot.send_message, tid, f"👑 Вам выдан VIP {lvl} на {days} дней!")
-            await msg.reply_text("Выдано.")
+            await safe(ctx.bot.send_message, tid, f"👑 <b>Тебе выдан VIP {lvl} на {days} дней!</b> 🍁", parse_mode=ParseMode.HTML)
+            await msg.reply_text("✅ VIP выдан.")
         except:
-            await msg.reply_text("Ошибка формата.")
+            await msg.reply_text("❌ Ошибка формата.")
 
     elif action == "dop":
         parts = text.split()
-        if len(parts) != 2: return await msg.reply_text("Формат: доп дней")
+        if len(parts) != 2: return await msg.reply_text("❌ Формат: доп дней")
         dop, days = parts[0], int(parts[1])
         await _grant_dop(tid, dop, days)
-        await safe(ctx.bot.send_message, tid, f"🎁 Выдан доп: {dop}")
-        await msg.reply_text("Выдано.")
+        await safe(ctx.bot.send_message, tid, f"🎁 <b>Тебе выдан доп: {dop}</b> 🍁", parse_mode=ParseMode.HTML)
+        await msg.reply_text("✅ Выдано.")
 
     elif action == "takedop":
         await _take_dop(tid, text.strip())
-        await safe(ctx.bot.send_message, tid, "⚠️ Один из ваших допов был снят администратором.")
+        await safe(ctx.bot.send_message, tid, "⚠️ Один из твоих допов был снят администратором.")
         await msg.reply_text("✅ Снято.")
 
     elif action == "givebyid":
         parts = text.split()
-        if len(parts) < 2: return await msg.reply_text("Формат: <tg_id> <тип> ...")
+        if len(parts) < 2: return await msg.reply_text("❌ Формат: <tg_id> <тип> ...")
         try:
             target = int(parts[0])
         except:
-            return await msg.reply_text("tg_id должен быть числом.")
+            return await msg.reply_text("❌ tg_id должен быть числом.")
         kind = parts[1].lower()
         target_user = await get_user(target)
         if not target_user:
-            return await msg.reply_text("Пользователь не найден в базе.")
+            return await msg.reply_text("❌ Пользователь не найден в базе.")
 
         if kind in ("вип", "vip"):
             try:
@@ -1045,45 +1107,43 @@ async def handle_admin_input(msg, ctx, state_row):
                 else: lvl = int(lvl_str)
                 days = int(parts[3])
             except:
-                return await msg.reply_text("Формат: <tg_id> вип <уровень> <дней>")
+                return await msg.reply_text("❌ Формат: <tg_id> вип <уровень> <дней>")
             until = (datetime.utcnow() + timedelta(days=days)).isoformat()
             lim = VIP_LIMITS.get(lvl, VIP_LIMITS[1])
             await upsert_user(target, vip_level=lvl, vip_until=until, chars_limit=lim["chars"], likes_left=lim["likes"])
-            await safe(ctx.bot.send_message, target, f"👑 Вам выдан VIP {lvl} на {days} дней!")
+            await safe(ctx.bot.send_message, target, f"👑 <b>Тебе выдан VIP {lvl} на {days} дней!</b> 🍁", parse_mode=ParseMode.HTML)
             await msg.reply_text(f"✅ VIP {lvl} на {days} дн. выдан {target}")
 
         elif kind in ("доп", "dop"):
-            if len(parts) < 3: return await msg.reply_text("Формат: <tg_id> доп <тип> [дней]")
+            if len(parts) < 3: return await msg.reply_text("❌ Формат: <tg_id> доп <тип> [дней]")
             dop = parts[2].lower()
             days = int(parts[3]) if len(parts) > 3 else 0
             await _grant_dop(target, dop, days)
-            await safe(ctx.bot.send_message, target, f"🎁 Выдан доп: {dop}")
+            await safe(ctx.bot.send_message, target, f"🎁 <b>Тебе выдан доп: {dop}</b> 🍁", parse_mode=ParseMode.HTML)
             await msg.reply_text(f"✅ Доп {dop} выдан {target}")
         else:
-            await msg.reply_text("Тип должен быть 'вип' или 'доп'.")
+            await msg.reply_text("❌ Тип должен быть 'вип' или 'доп'.")
 
     elif action == "takebyid":
         parts = text.split()
-        if len(parts) != 2: return await msg.reply_text("Формат: <tg_id> <тип>")
+        if len(parts) != 2: return await msg.reply_text("❌ Формат: <tg_id> <тип>")
         try:
             target = int(parts[0])
         except:
-            return await msg.reply_text("tg_id должен быть числом.")
+            return await msg.reply_text("❌ tg_id должен быть числом.")
         kind = parts[1].lower()
         target_user = await get_user(target)
         if not target_user:
-            return await msg.reply_text("Пользователь не найден.")
+            return await msg.reply_text("❌ Пользователь не найден.")
 
         if kind in ("вип", "vip"):
             await upsert_user(target, vip_level=0, vip_until=None, chars_limit=300, likes_left=20)
-            await safe(ctx.bot.send_message, target, "⚠️ Ваш VIP был снят администратором.")
+            await safe(ctx.bot.send_message, target, "⚠️ Твой VIP был снят администратором.")
             await msg.reply_text(f"✅ VIP снят у {target}")
         else:
             await _take_dop(target, kind)
-            await safe(ctx.bot.send_message, target, "⚠️ Один из ваших допов был снят администратором.")
+            await safe(ctx.bot.send_message, target, "⚠️ Один из твоих допов был снят администратором.")
             await msg.reply_text(f"✅ Доп {kind} снят у {target}")
-
-# ------------------ ЗАПУСК ------------------
 
 async def post_init(app: Application):
     await app.bot.set_my_commands([])
