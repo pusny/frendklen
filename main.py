@@ -743,6 +743,14 @@ async def private_message(update, ctx):
         await handle_profile_edit(update, ctx, u, msg.text)
         raise ApplicationHandlerStop
 
+    if not u["agreed"]:
+        await msg.reply_text(AGREEMENT_TEXT, parse_mode=ParseMode.HTML, reply_markup=kb_agree())
+        raise ApplicationHandlerStop
+
+    if not u["phone"]:
+        await ask_phone(msg)
+        raise ApplicationHandlerStop
+
     if not u["circle_file_id"]:
         if msg.video_note:
             await handle_circle(update, ctx, u)
