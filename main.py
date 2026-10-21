@@ -14,8 +14,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
-    InlineQueryResultArticle, InputTextMessageContent,
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, BotCommand,
 )
 import aiosqlite
 from dotenv import load_dotenv
@@ -27,7 +26,9 @@ ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 SUPERADMIN_ID = int(os.getenv("SUPERADMIN_ID", "0"))
 PAYMENT_LINK = os.getenv("PAYMENT_LINK", "")
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "@support")
-DB_PATH = os.getenv("DB_PATH", "data.db")
+DB_PATH = os.getenv("DB_PATH", "data/data.db")
+
+os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
 
 PRICES = {
     "vip_low": (300, "VIP Низкий, 1 месяц"),
@@ -51,9 +52,8 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
 
 router = Router()
-ADMIN_VERIFY_WORDS = ["КЛЕН", "ЛИСТ", "БУКЕТ", "ОСЕНЬ", "ВЕТЕР", "ЗАКАТ"]
+VERIFY_WORDS = ["КЛЕН", "ЛИСТ", "БУКЕТ", "ОСЕНЬ", "ВЕТЕР", "ЗАКАТ"]
 
-# ---------- DB ----------
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(
  tg_id INTEGER PRIMARY KEY, username TEXT, phone TEXT,
@@ -75,8 +75,6 @@ CREATE TABLE IF NOT EXISTS purchases(id INTEGER PRIMARY KEY AUTOINCREMENT, tg_id
 CREATE TABLE IF NOT EXISTS tickets(id INTEGER PRIMARY KEY AUTOINCREMENT, tg_id INTEGER, status TEXT DEFAULT 'open', created_at TEXT);
 CREATE TABLE IF NOT EXISTS ticket_msgs(id INTEGER PRIMARY KEY AUTOINCREMENT, ticket_id INTEGER, from_admin INTEGER, text TEXT, created_at TEXT);
 CREATE TABLE IF NOT EXISTS reports(id INTEGER PRIMARY KEY AUTOINCREMENT, reporter INTEGER, target INTEGER, reason TEXT, created_at TEXT);
-CREATE TABLE IF NOT EXISTS admin_msgs(id INTEGER PRIMARY KEY AUTOINCREMENT, tg_id INTEGER, msg_id INTEGER, kind TEXT);
-CREATE TABLE IF NOT EXISTS pending_rework(tg_id INTEGER PRIMARY KEY, admin_chat_msg INTEGER);
 """
 
 async def db_init():
@@ -87,7 +85,6 @@ async def db_init():
 def now():
     return datetime.utcnow().isoformat()
 
-# ---------- helpers ----------
 async def get_user(tg_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -133,7 +130,6 @@ async def refresh_likes(tg_id: int):
     if not reset or datetime.fromisoformat(reset) < datetime.utcnow() - timedelta(days=1):
         await upsert_user(tg_id, likes_left=lim["likes"], likes_reset_at=now())
 
-# ---------- states ----------
 class S(StatesGroup):
     contact = State()
     video = State()
@@ -144,7 +140,6 @@ class S(StatesGroup):
     admin_wait_amount = State()
     admin_wait_comment = State()
 
-# ---------- start ----------
 @router.message(CommandStart())
 async def cmd_start(m: Message, state: FSMContext):
     await state.clear()
@@ -154,7 +149,7 @@ async def cmd_start(m: Message, state: FSMContext):
         return await m.answer(f"🚫 Доступ к боту заблокирован.\nПричина: {reason}")
     if u["status"] == "active":
         return await main_menu(m)
-    if u["status"] in ("new",):
+    if u["status"] == "new":
         await state.set_state(S.contact)
         kb = ReplyKeyboardMarkup(
             keyboard=[[KeyboardButton(text="📱 Поделиться номером", request_contact=True)]],
@@ -185,7 +180,7 @@ async def on_contact(m: Message, state: FSMContext):
     await ask_video(m)
 
 async def ask_video(m: Message):
-    words = random.sample(ADMIN_VERIFY_WORDS, 3)
+    words = random.sample(VERIFY_WORDS, 3)
     await m.answer(
         "✅ Номер принят.\n\n"
         f"📹 Теперь пришлите <b>видео-кружок</b> (нажмите на скрепку → «Видео-кружок»), "
@@ -231,7 +226,7 @@ async def ask_form(m: Message, u: dict, video_note_file_id: Optional[str] = None
     lim = await vip_limits(u)
     chars = max(u.get("chars_limit") or 300, lim["chars"])
     await m.answer(
-        "📝 Заполните анкету, скопировав шаблон тапом ниже (он уже в моно-шрифте):\n\n"
+        "📝 Заполните анкету, скопировав шаблон тапом ниже:\n\n"
         f"{FORM_TEMPLATE}\n\n"
         f"Лимит символов: <b>{chars}</b>.\n"
         "По желанию прикрепите 1 фото в этом же сообщении.\n"
@@ -246,12 +241,10 @@ def parse_form(text: str):
     keys = ["name", "age", "pronouns", "city", "diagnosis", "reason", "hobby"]
     for i, key in enumerate(keys):
         line = lines[i]
-        if not line.startswith(f"{i+1}.") and not line.startswith(f"{i+1}."):
+        if not line.startswith(f"{i+1}."):
             return None
         val = line.split(".", 1)[1].strip().lstrip(":").strip()
         if not val:
-            return None
-        if len(val) > 300:
             return None
         out[key] = val
     try:
@@ -311,7 +304,6 @@ async def send_to_admin_chat(bot: Bot, prof: dict, u: dict):
         await bot.send_photo(ADMIN_CHAT_ID, prof["photo1"])
     await bot.send_message(ADMIN_CHAT_ID, text, reply_markup=kb, parse_mode="HTML")
 
-# ---------- admin verify callbacks ----------
 @router.callback_query(F.data.startswith("adm:"))
 async def adm_verify(cb: CallbackQuery, state: FSMContext):
     if cb.from_user.id != SUPERADMIN_ID:
@@ -324,16 +316,16 @@ async def adm_verify(cb: CallbackQuery, state: FSMContext):
             await db.execute("UPDATE users SET status='active', banned=0 WHERE tg_id=?", (tid,))
             await db.commit()
         await cb.bot.send_message(tid, "🎉 Ваша анкета одобрена! Добро пожаловать в «Кленовый букетик».")
-        await cb.message.edit_text(cb.message.html_text + "\n\n✅ Принято", reply_markup=None)
+        await cb.message.edit_reply_markup(reply_markup=None)
     elif action == "reject":
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("UPDATE users SET status='banned', banned=1, ban_reason='Отклонено модератором' WHERE tg_id=?", (tid,))
             await db.commit()
         await cb.bot.send_message(tid, "🚫 Ваша анкета отклонена. Доступ к боту заблокирован.")
-        await cb.message.edit_text(cb.message.html_text + "\n\n❌ Отклонено", reply_markup=None)
+        await cb.message.edit_reply_markup(reply_markup=None)
     elif action == "rework":
         await state.set_state(S.admin_wait_comment)
-        await state.update_data(rework_tid=tid, rework_msg=cb.message.message_id)
+        await state.update_data(rework_tid=tid)
         await cb.message.answer(f"Введите комментарий для пользователя {tid}:")
     await cb.answer()
 
@@ -353,7 +345,6 @@ async def rework_comment(m: Message, state: FSMContext):
     await m.bot.send_message(tid, f"✏️ Вашу анкету нужно переделать.\nКомментарий: {m.text}\n\nОтправьте /start чтобы заполнить заново.")
     await m.answer("Комментарий отправлен пользователю.")
 
-# ---------- main menu ----------
 def main_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🗂 Анкеты", callback_data="menu:ankety")],
@@ -372,7 +363,6 @@ async def back_menu(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text("🏠 <b>Главное меню</b>", reply_markup=main_menu_kb(), parse_mode="HTML")
     await cb.answer()
 
-# ---------- profiles browse ----------
 @router.callback_query(F.data == "menu:ankety")
 async def ankety(cb: CallbackQuery):
     await refresh_likes(cb.from_user.id)
@@ -400,6 +390,7 @@ async def show_next_profile(cb: CallbackQuery, offset: int):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❤️ Лайк", callback_data=f"like:{prof['tg_id']}"),
          InlineKeyboardButton(text="➡️ Скип", callback_data=f"skip:{offset+1}")],
+        [InlineKeyboardButton(text="🚨 Жалоба", callback_data=f"report:{prof['tg_id']}")],
         [InlineKeyboardButton(text="⬅️ Меню", callback_data="menu:back")],
     ])
     if prof.get("photo1"):
@@ -430,32 +421,21 @@ async def like(cb: CallbackQuery):
         mutual = await cur.fetchone()
     if mutual:
         try:
-            await cb.bot.send_message(target, "💞 Взаимный лайк! Напишите человеку: /start и раздел «Чат инкогнито».")
+            await cb.bot.send_message(target, "💞 Взаимный лайк! Зайдите в раздел «Чат инкогнито».")
         except Exception:
             pass
         await cb.message.answer("💞 Взаимно! Человек получил уведомление.")
     await cb.answer("❤️ Лайк отправлен")
     await show_next_profile(cb, 0)
 
-# ---------- incognito ----------
 @router.callback_query(F.data == "menu:incognito")
 async def incognito(cb: CallbackQuery):
     u = await get_user(cb.from_user.id)
-    lim = await vip_limits(u)
-    if lim["priority"] < 3 and not (u.get("vip_until") and datetime.fromisoformat(u["vip_until"]) > datetime.utcnow()):
-        if u["vip_level"] == 0:
-            return await cb.answer("Доступ по VIP или купите дневной доп.", show_alert=True)
-    await cb.message.answer("💬 Отправьте сообщение — оно будет доставлено анонимно человеку, с которым у вас взаимный лайк. Контакты скрыты.")
+    if u["vip_level"] == 0:
+        return await cb.answer("Доступ по VIP или купите дневной доп.", show_alert=True)
+    await cb.message.answer("💬 Отправьте сообщение — оно уйдёт анонимно человеку, с которым у вас взаимный лайк.")
     await cb.answer()
 
-@router.message(F.chat.type == ChatType.PRIVATE, F.text, lambda m: m.from_user.id != SUPERADMIN_ID)
-async def pm_router(m: Message, state: FSMContext):
-    cur = await state.get_state()
-    if cur:
-        return
-    await m.answer("Используйте /start для навигации.")
-
-# ---------- shop ----------
 SHOP_ITEMS = {
     "vip_low": "VIP Низкий: 40 лайков/день, 600 символов, приоритет выше. 300₽/мес",
     "vip_mid": "VIP Средний: 60 лайков, 800 символов, 2 фото. 500₽/мес",
@@ -492,14 +472,13 @@ async def buy(cb: CallbackQuery):
     await cb.message.edit_text(
         f"Оплата: <b>{name}</b> — {price}₽.\n\n"
         f"Перейдите по ссылке и оплатите: {PAYMENT_LINK}\n"
-        "После оплаты администратор выдаст доступ вручную (в течение 24ч).",
+        "После оплаты администратор выдаст доступ вручную.",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:shop")]]))
     await cb.bot.send_message(SUPERADMIN_ID,
         f"💰 Покупка: tg={cb.from_user.id}, {name}, {price}₽")
     await cb.answer()
 
-# ---------- support ----------
 @router.callback_query(F.data == "menu:support")
 async def support(cb: CallbackQuery, state: FSMContext):
     await state.set_state(S.support)
@@ -516,7 +495,7 @@ async def support_msg(m: Message, state: FSMContext):
                          (tid, 0, m.text or "[медиа]", now()))
         await db.commit()
     await m.bot.send_message(SUPERADMIN_ID,
-        f"🆘 Новый тикет #{tid} от {m.from_user.id}\n\n{m.text}\n\nОтветьте командой /reply {tid} <текст>")
+        f"🆘 Новый тикет #{tid} от {m.from_user.id}\n\n{m.text}\n\nОтвет: /reply {tid} <текст>")
     await state.clear()
     await m.answer("✅ Обращение отправлено. Ожидайте ответа.")
 
@@ -540,7 +519,6 @@ async def reply_ticket(m: Message):
     await m.bot.send_message(t["tg_id"], f"🆘 Ответ поддержки по тикету #{tid}:\n\n{txt}")
     await m.answer("Ответ отправлен.")
 
-# ---------- profile ----------
 @router.callback_query(F.data == "menu:profile")
 async def my_profile(cb: CallbackQuery):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -558,7 +536,6 @@ async def my_profile(cb: CallbackQuery):
     await cb.message.answer(text, parse_mode="HTML")
     await cb.answer()
 
-# ---------- report ----------
 @router.callback_query(F.data.startswith("report:"))
 async def report(cb: CallbackQuery, state: FSMContext):
     target = int(cb.data.split(":")[1])
@@ -579,7 +556,6 @@ async def report_reason(m: Message, state: FSMContext):
     await state.clear()
     await m.answer("✅ Жалоба отправлена.")
 
-# ---------- admin panel ----------
 @router.message(Command("admin"))
 async def admin(m: Message):
     if m.from_user.id != SUPERADMIN_ID:
@@ -590,11 +566,9 @@ def admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👥 Пользователи", callback_data="a:users:0")],
         [InlineKeyboardButton(text="📝 На модерации", callback_data="a:pending")],
-        [InlineKeyboardButton(text="🛒 Выдать товар", callback_data="a:give")],
         [InlineKeyboardButton(text="🚫 Баны", callback_data="a:bans")],
         [InlineKeyboardButton(text="📨 Тикеты", callback_data="a:tickets")],
         [InlineKeyboardButton(text="🚨 Жалобы", callback_data="a:reports")],
-        [InlineKeyboardButton(text="📢 Рассылка", callback_data="a:broadcast")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="a:stats")],
     ])
 
@@ -657,14 +631,12 @@ async def admin_cb(cb: CallbackQuery, state: FSMContext):
         tid = int(parts[2])
         await state.set_state(S.admin_wait_amount)
         await state.update_data(op="dop", tid=tid)
-        await cb.message.answer("Введите доп (chars600 / unlimited / prev / second / incognito) и дней (0 для навсегда):")
+        await cb.message.answer("Введите доп (chars600 / unlimited / prev / second / incognito) и дней:")
     elif action == "delprof":
         tid = int(parts[2])
         await state.set_state(S.admin_wait_amount)
         await state.update_data(op="delprof", tid=tid)
         await cb.message.answer("Введите причину удаления анкеты:")
-    elif action == "give":
-        await cb.message.answer("Используйте карточку пользователя → «Выдать VIP/доп».")
     elif action == "pending":
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
@@ -710,10 +682,6 @@ async def admin_cb(cb: CallbackQuery, state: FSMContext):
             cur = await db.execute("SELECT COUNT(*) FROM users WHERE banned=1"); bans = (await cur.fetchone())[0]
             cur = await db.execute("SELECT vip_level, COUNT(*) FROM users GROUP BY vip_level"); vips = await cur.fetchall()
         await cb.message.answer(f"📊 Всего: {total}\nАктивных: {active}\nНа модерации: {pend}\nЗабанено: {bans}\nVIP: {vips}")
-    elif action == "broadcast":
-        await state.set_state(S.support)
-        await state.update_data(broadcast=True)
-        await cb.message.answer("Введите текст рассылки:")
     elif action == "back":
         await cb.message.edit_text("🛠 <b>Админ-панель</b>", reply_markup=admin_kb(), parse_mode="HTML")
     await cb.answer()
@@ -784,22 +752,24 @@ async def admin_reason(m: Message, state: FSMContext):
         try: await m.bot.send_message(tid, f"🚫 Доступ заблокирован. Причина: {m.text}")
         except Exception: pass
 
-@router.message(F.text.startswith("/admin_broadcast"))
-async def _noop(m: Message):
-    pass
-
-async def on_startup(bot: Bot):
-    await db_init()
-    await bot.set_my_commands([
-        ("start", "Главное меню"),
-        ("admin", "Админ-панель"),
-    ])
+@router.message(F.chat.type == ChatType.PRIVATE, F.text)
+async def pm_router(m: Message, state: FSMContext):
+    cur = await state.get_state()
+    if cur:
+        return
+    if m.text and m.text.startswith("/"):
+        return
+    await m.answer("Используйте /start для навигации.")
 
 async def main():
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    await on_startup(bot)
+    await db_init()
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Главное меню"),
+        BotCommand(command="admin", description="Админ-панель"),
+    ])
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
