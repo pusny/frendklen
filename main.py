@@ -69,7 +69,7 @@ CREATE TABLE IF NOT EXISTS users(
  likes_left INTEGER DEFAULT 20, likes_reset_at TEXT,
  photos_used INTEGER DEFAULT 0, video_used INTEGER DEFAULT 0,
  chars_limit INTEGER DEFAULT 300, prev_anketa_id INTEGER,
- attempts_left INTEGER DEFAULT 3, verify_words TEXT, created_at TEXT
+ attempts_left INTEGER DEFAULT 3, verify_words TEXT, has_prev_addon INTEGER DEFAULT 0, created_at TEXT
 );
 CREATE TABLE IF NOT EXISTS profiles(
  id INTEGER PRIMARY KEY AUTOINCREMENT, tg_id INTEGER UNIQUE,
@@ -87,6 +87,11 @@ CREATE TABLE IF NOT EXISTS reports(id INTEGER PRIMARY KEY AUTOINCREMENT, reporte
 async def db_init():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(SCHEMA)
+        # Автомиграция для тех, у кого уже есть старая база
+        try: await db.execute("ALTER TABLE users ADD COLUMN verify_words TEXT")
+        except Exception: pass
+        try: await db.execute("ALTER TABLE users ADD COLUMN has_prev_addon INTEGER DEFAULT 0")
+        except Exception: pass
         await db.commit()
 
 def now():
@@ -457,20 +462,38 @@ async def show_next_profile(cb: CallbackQuery, offset: int):
             "WHERE p.approved=1 AND p.tg_id!=? ORDER BY u.vip_level DESC, p.id DESC LIMIT 1 OFFSET ?",
             (cb.from_user.id, offset))
         prof = await cur.fetchone()
+        
+    u = await get_user(cb.from_user.id)
+    has_prev_access = (u["vip_level"] == 3) or (u.get("has_prev_addon") == 1)
+    
     if not prof:
-        return await cb.answer("На данный момент анкет больше нет.", show_alert=True)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:back")]
+        ])
+        if u.get("prev_anketa_id") and has_prev_access:
+            kb.inline_keyboard.insert(0, [InlineKeyboardButton(text="⏪ Вернуться к пропущенной", callback_data=f"prev:{u['prev_anketa_id']}")])
+        return await cb.message.answer("На данный момент анкет больше нет.", reply_markup=kb)
+        
     prof = dict(prof)
     text = (f"👤 <b>{prof['name']}</b>, {prof['age']} ({prof['pronouns']})\n"
             f"📍 {prof['city']}\n\n"
             f"🩺 <b>Диагноз:</b> {prof['diagnosis']}\n"
             f"💭 <b>Ищет:</b> {prof['reason']}\n"
             f"🎨 <b>Хобби:</b> {prof['hobby']}")
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+            
+    kb_list = [
         [InlineKeyboardButton(text="❤️ Лайк", callback_data=f"like:{prof['tg_id']}"),
-         InlineKeyboardButton(text="➡️ Пропустить", callback_data=f"skip:{offset+1}")],
-        [InlineKeyboardButton(text="🚨 Жалоба", callback_data=f"report:{prof['tg_id']}")],
-        [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:back")],
-    ])
+         InlineKeyboardButton(text="➡️ Пропустить", callback_data=f"skip:{offset+1}:{prof['tg_id']}")],
+    ]
+    
+    if u.get("prev_anketa_id") and has_prev_access:
+        kb_list.append([InlineKeyboardButton(text="⏪ Вернуть пропущенную анкету", callback_data=f"prev:{u['prev_anketa_id']}")])
+        
+    kb_list.append([InlineKeyboardButton(text="🚨 Жалоба", callback_data=f"report:{prof['tg_id']}")])
+    kb_list.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:back")])
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_list)
+    
     if prof.get("photo1"):
         await cb.message.answer_photo(prof["photo1"], caption=text, reply_markup=kb, parse_mode="HTML")
     else:
@@ -478,9 +501,47 @@ async def show_next_profile(cb: CallbackQuery, offset: int):
 
 @router.callback_query(F.data.startswith("skip:"))
 async def skip(cb: CallbackQuery):
-    offset = int(cb.data.split(":")[1])
+    parts = cb.data.split(":")
+    offset = int(parts[1])
+    skipped_id = int(parts[2])
+    await upsert_user(cb.from_user.id, prev_anketa_id=skipped_id)
     await cb.answer("Анкета пропущена")
     await show_next_profile(cb, offset)
+
+@router.callback_query(F.data.startswith("prev:"))
+async def prev_profile(cb: CallbackQuery):
+    target_id = int(cb.data.split(":")[1])
+    u = await get_user(cb.from_user.id)
+    has_prev_access = (u["vip_level"] == 3) or (u.get("has_prev_addon") == 1)
+    if not has_prev_access:
+        return await cb.answer("Эта функция доступна только с VIP Высоким или допом «Возврат анкеты».", show_alert=True)
+        
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM profiles WHERE tg_id=?", (target_id,))
+        prof = await cur.fetchone()
+        
+    if not prof:
+        return await cb.answer("Эта анкета больше недоступна.", show_alert=True)
+        
+    prof = dict(prof)
+    text = (f"👤 <b>{prof['name']}</b>, {prof['age']} ({prof['pronouns']})\n"
+            f"📍 {prof['city']}\n\n"
+            f"🩺 <b>Диагноз:</b> {prof['diagnosis']}\n"
+            f"💭 <b>Ищет:</b> {prof['reason']}\n"
+            f"🎨 <b>Хобби:</b> {prof['hobby']}")
+            
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❤️ Лайк", callback_data=f"like:{prof['tg_id']}"),
+         InlineKeyboardButton(text="➡️ Пропустить", callback_data=f"skip:0:{prof['tg_id']}")],
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:back")],
+    ])
+    
+    if prof.get("photo1"):
+        await cb.message.answer_photo(prof["photo1"], caption=text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await cb.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await cb.answer()
 
 @router.callback_query(F.data.startswith("like:"))
 async def like(cb: CallbackQuery):
@@ -539,7 +600,7 @@ async def buy_info(cb: CallbackQuery):
     elif key == "vip_mid":
         text = "🟡 <b>VIP Средний</b> (500₽ / 1 месяц)\n\n• 60 лайков в день\n• Лимит символов в анкете: 800\n• Возможность загрузить 2 фото\n• Приоритет в выдаче анкет: повышенный"
     elif key == "vip_high":
-        text = "🔴 <b>VIP Высокий</b> (700₽ / 1 месяц)\n\n• Безлимитные лайки\n• Лимит символов: 1000\n• Возможность загрузить 2 фото и видео (15 сек)\n• Возврат к предыдущей анкете\n• Приоритет в выдаче анкет: максимальный"
+        text = "🔴 <b>VIP Высокий</b> (700₽ / 1 месяц)\n\n• Безлимитные лайки\n• Лимит символов: 1000\n• Возможность загрузить 2 фото и видео (15 сек)\n• <b>Возврат к предыдущей анкете</b>\n• Приоритет в выдаче анкет: максимальный"
     elif key == "chars_600":
         text = "📝 <b>Лимит символов до 600</b> (40₽)\n\nРазблокирует возможность писать более длинные тексты в анкете (до 600 символов вместо 300)."
     elif key == "unlimited_likes":
@@ -804,7 +865,7 @@ async def grant_dop(tid, dop, days, bot):
     elif dop == "second":
         await upsert_user(tid, photos_used=0)
     elif dop == "prev":
-        pass
+        await upsert_user(tid, has_prev_addon=1)
     elif dop == "incognito":
         until = (datetime.utcnow() + timedelta(days=max(days,1))).isoformat()
         await upsert_user(tid, vip_until=until, vip_level=max(u["vip_level"], 1))
