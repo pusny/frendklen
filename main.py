@@ -3,6 +3,7 @@ import os
 import random
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from html import escape
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -75,10 +76,6 @@ def _init_db():
             name TEXT, age TEXT, city TEXT, diagnosis TEXT, about TEXT,
             approved INTEGER DEFAULT 0, rejected INTEGER DEFAULT 0
         );
-        CREATE TABLE IF NOT EXISTS likes (
-            from_id INTEGER, to_id INTEGER, ts TEXT,
-            PRIMARY KEY (from_id, to_id)
-        );
         CREATE TABLE IF NOT EXISTS anon_queue (
             user_id INTEGER PRIMARY KEY, ts TEXT
         );
@@ -89,9 +86,22 @@ def _init_db():
         CREATE TABLE IF NOT EXISTS prices (key TEXT PRIMARY KEY, val INTEGER);
         CREATE TABLE IF NOT EXISTS admin_msgs (msg_id INTEGER PRIMARY KEY, user_id INTEGER, mtype TEXT);
         """)
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
-        if "full_name" not in cols:
+        cols_u = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "full_name" not in cols_u:
             conn.execute("ALTER TABLE users ADD COLUMN full_name TEXT")
+
+        cols_l = {r[1] for r in conn.execute("PRAGMA table_info(likes)").fetchall()}
+        if cols_l and "id" not in cols_l:
+            try:
+                conn.execute("ALTER TABLE likes RENAME TO likes_old")
+                conn.execute("CREATE TABLE likes (id INTEGER PRIMARY KEY AUTOINCREMENT, from_id INTEGER, to_id INTEGER, ts TEXT)")
+                conn.execute("INSERT INTO likes(from_id,to_id,ts) SELECT from_id,to_id,ts FROM likes_old")
+                conn.execute("DROP TABLE likes_old")
+            except Exception:
+                pass
+        conn.execute("CREATE TABLE IF NOT EXISTS likes (id INTEGER PRIMARY KEY AUTOINCREMENT, from_id INTEGER, to_id INTEGER, ts TEXT)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_likes_ft ON likes(from_id, to_id, ts)")
+
         for k, v in {
             "vip1": int(os.getenv("VIP1_PRICE") or 200),
             "vip2": int(os.getenv("VIP2_PRICE") or 350),
@@ -227,6 +237,16 @@ def parse_profile(text):
     if len(data) < 5 or any(not v for v in data.values()):
         return None
     return data
+
+
+def fmt_profile_fields(p):
+    return (
+        f"Имя: {escape(str(p['name']))}\n"
+        f"Возраст: {escape(str(p['age']))}\n"
+        f"Город: {escape(str(p['city']))}\n"
+        f"Диагноз: {escape(str(p['diagnosis']))}\n"
+        f"О себе: {escape(str(p['about']))}"
+    )
 
 
 AGREEMENT_TEXT = (
@@ -449,6 +469,35 @@ async def ban_cb_mw(update, ctx):
         raise ApplicationHandlerStop
 
 
+async def moderation_mw(update, ctx):
+    q = update.callback_query
+    if not q:
+        return
+    user = q.from_user
+    if not user:
+        return
+    if user.id == ADMIN_ID:
+        return
+    if q.message and q.message.chat.id == ADMIN_CHAT_ID:
+        try:
+            m = await ctx.bot.get_chat_member(ADMIN_CHAT_ID, user.id)
+            if m.status in ("creator", "administrator"):
+                return
+        except Exception:
+            pass
+    u = db_get_user(user.id, user)
+    if u["banned"]:
+        return
+    p = db_get_profile(user.id)
+    if p and p["approved"]:
+        return
+    data = q.data or ""
+    if data == "menu:main" or data.startswith("agree:"):
+        return
+    await q.answer("⏳ Анкета на модерации. Дождитесь одобрения администратором.", show_alert=True)
+    raise ApplicationHandlerStop
+
+
 async def cmd_start(update, ctx):
     msg = update.effective_message
     uid = update.effective_user.id
@@ -470,8 +519,12 @@ async def cmd_start(update, ctx):
         return await start_circle(msg, ctx, uid)
     if not p["approved"]:
         return await msg.reply_text(
-            "⏳ Анкета на модерации.",
-            reply_markup=kb_main(uid == ADMIN_ID),
+            "⏳ <b>Ваша анкета на модерации.</b>\n\n"
+            "Доступ к функциям бота откроется после одобрения администратором.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔄 Проверить статус", callback_data="menu:main"),
+            ]]),
         )
     await msg.reply_text(
         "🍁 <b>Главное меню</b>",
@@ -555,19 +608,25 @@ async def handle_profile(update, ctx, u, text):
             parse_mode=ParseMode.HTML,
         )
     db_save_profile(uid, data["name"], data["age"], data["city"], data["diagnosis"], data["about"])
-    await msg.reply_text("✅ Анкета отправлена на модерацию.", reply_markup=kb_main(uid == ADMIN_ID))
+    await msg.reply_text(
+        "✅ Анкета отправлена на модерацию.\n\n"
+        "Доступ к функциям бота откроется после одобрения администратором.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔄 Проверить статус", callback_data="menu:main"),
+        ]]),
+    )
 
     profile_text = (
         f"🍁 <b>Новая анкета</b>\n\n"
-        f"Юзер: <code>{uid}</code> @{update.effective_user.username or '-'}\n"
-        f"Телефон: <code>{u['phone']}</code>\n"
-        f"Фраза: <code>{u['circle_phrase'] or '—'}</code>\n\n"
+        f"Юзер: <code>{uid}</code> @{escape(update.effective_user.username or '-')}\n"
+        f"Телефон: <code>{escape(str(u['phone']))}</code>\n"
+        f"Фраза: <code>{escape(u['circle_phrase'] or '—')}</code>\n\n"
         f"<b>Анкета:</b>\n"
-        f"Имя: {data['name']}\n"
-        f"Возраст: {data['age']}\n"
-        f"Город: {data['city']}\n"
-        f"Диагноз: {data['diagnosis']}\n"
-        f"Описание: {data['about']}"
+        f"Имя: {escape(str(data['name']))}\n"
+        f"Возраст: {escape(str(data['age']))}\n"
+        f"Город: {escape(str(data['city']))}\n"
+        f"Диагноз: {escape(str(data['diagnosis']))}\n"
+        f"Описание: {escape(str(data['about']))}"
     )
     sent = await to_admin(ctx.bot, TOPIC_APPS, profile_text, reply_markup=kb_app_review(uid))
     if sent:
@@ -621,7 +680,7 @@ async def handle_support(update, ctx):
     uid = update.effective_user.id
     ctx.user_data.pop("support_mode", None)
     await msg.reply_text("✅ Тикет создан. Ожидайте ответа.", reply_markup=kb_main(uid == ADMIN_ID))
-    text = f"🆘 <b>Тикет</b>\nОт: <code>{uid}</code> @{update.effective_user.username or '-'}\n\n{msg.text}"
+    text = f"🆘 <b>Тикет</b>\nОт: <code>{uid}</code> @{escape(update.effective_user.username or '-')}\n\n{escape(msg.text or '')}"
     sent = await to_admin(ctx.bot, TOPIC_TICKETS, text, reply_markup=kb_ticket(uid))
     if sent:
         db_save_admin_msg(sent.message_id, uid, "ticket")
@@ -668,6 +727,16 @@ async def private_message(update, ctx):
             await handle_profile(update, ctx, u, msg.text)
         else:
             await msg.reply_text("❌ Отправьте анкету текстом по шаблону.")
+        raise ApplicationHandlerStop
+
+    if not p["approved"]:
+        await msg.reply_text(
+            "⏳ <b>Ваша анкета на модерации.</b>\nДождитесь одобрения администратором.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔄 Проверить статус", callback_data="menu:main"),
+            ]]),
+        )
         raise ApplicationHandlerStop
 
     if msg.text:
@@ -719,7 +788,7 @@ async def admin_chat_handler(update, ctx):
 
     if ctx.user_data.get("ticket_reply_to") and msg.text:
         uid = ctx.user_data.pop("ticket_reply_to")
-        await safe_send(ctx.bot, uid, f"📩 <b>Ответ поддержки:</b>\n\n{msg.text}")
+        await safe_send(ctx.bot, uid, f"📩 <b>Ответ поддержки:</b>\n\n{escape(msg.text)}")
         await msg.reply_text("✅ Отправлено.")
         raise ApplicationHandlerStop
 
@@ -849,6 +918,19 @@ async def cb_menu_main(update, ctx):
     uid = q.from_user.id
     ctx.user_data.pop("support_mode", None)
     ctx.user_data.pop("edit_text_mode", None)
+    u = db_get_user(uid, q.from_user)
+    p = db_get_profile(uid)
+    if uid != ADMIN_ID and (not p or not p["approved"]):
+        await q.message.edit_text(
+            "⏳ <b>Ваша анкета на модерации.</b>\n\n"
+            "Доступ к функциям бота откроется после одобрения администратором.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔄 Проверить статус", callback_data="menu:main"),
+            ]]),
+        )
+        await q.answer()
+        return
     await q.message.edit_text(
         "🍁 <b>Главное меню</b>",
         parse_mode=ParseMode.HTML,
@@ -866,23 +948,38 @@ async def cb_menu_profiles(update, ctx):
 
 
 async def show_profile(q, uid):
+    today = datetime.now(timezone.utc).date().isoformat()
     with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
         conn.row_factory = sqlite3.Row
         r = conn.execute("""
             SELECT p.* FROM profiles p
             WHERE p.approved=1 AND p.user_id != ?
-              AND p.user_id NOT IN (SELECT to_id FROM likes WHERE from_id=?)
+              AND p.user_id NOT IN (
+                  SELECT to_id FROM likes WHERE from_id=? AND substr(ts,1,10)=?
+              )
             ORDER BY RANDOM() LIMIT 1
-        """, (uid, uid)).fetchone()
+        """, (uid, uid, today)).fetchone()
     if not r:
-        await q.message.edit_text("🍁 Анкеты закончились.", reply_markup=kb_back())
+        try:
+            await q.message.edit_text(
+                "🍁 <b>Анкет для показа нет.</b>\n\n"
+                "Возможно, все анкеты закончились или вы уже всех лайкнули сегодня. "
+                "Заходите позже!",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_back(),
+            )
+        except Exception:
+            pass
         return
     p = dict(r)
     u = db_get_user(uid)
     text = (
         f"<b>🍁 Анкета</b>\n\n"
-        f"Имя: {p['name']}\nВозраст: {p['age']}\nГород: {p['city']}\n"
-        f"Диагноз: {p['diagnosis']}\nО себе: {p['about']}"
+        f"Имя: {escape(str(p['name']))}\n"
+        f"Возраст: {escape(str(p['age']))}\n"
+        f"Город: {escape(str(p['city']))}\n"
+        f"Диагноз: {escape(str(p['diagnosis']))}\n"
+        f"О себе: {escape(str(p['about']))}"
     )
     rows = [[
         InlineKeyboardButton("❤️ Лайк", callback_data=f"like:{p['user_id']}"),
@@ -892,8 +989,15 @@ async def show_profile(q, uid):
     if u["vip"] == 3:
         rows.insert(1, [InlineKeyboardButton("⬅️ Назад", callback_data=f"back:{p['user_id']}")])
     rows.append([InlineKeyboardButton("◀️ В меню", callback_data="menu:main")])
-    await q.message.edit_text(text, parse_mode=ParseMode.HTML,
-                              reply_markup=InlineKeyboardMarkup(rows))
+    try:
+        await q.message.edit_text(text, parse_mode=ParseMode.HTML,
+                                  reply_markup=InlineKeyboardMarkup(rows))
+    except Exception:
+        try:
+            await q.message.answer(text, parse_mode=ParseMode.HTML,
+                                   reply_markup=InlineKeyboardMarkup(rows))
+        except Exception:
+            pass
 
 
 async def cb_like(update, ctx):
@@ -904,18 +1008,36 @@ async def cb_like(update, ctx):
     u = db_get_user(uid)
     if u["likes_left"] <= 0:
         await q.answer()
-        return await q.message.edit_text(
-            "⚠️ <b>Лимит лайков на сегодня исчерпан.</b>\n"
-            "Хотите больше? Купите VIP в магазине.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb_back("menu:profiles"),
-        )
+        try:
+            await q.message.edit_text(
+                "⚠️ <b>Лимит лайков на сегодня исчерпан.</b>\n"
+                "Хотите больше? Купите VIP в магазине.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_back("menu:profiles"),
+            )
+        except Exception:
+            pass
+        return
+
+    today = datetime.now(timezone.utc).date().isoformat()
     with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
-        conn.execute("INSERT OR IGNORE INTO likes(from_id,to_id,ts) VALUES(?,?,?)",
-                     (uid, target, datetime.now(timezone.utc).isoformat()))
+        already = conn.execute(
+            "SELECT 1 FROM likes WHERE from_id=? AND to_id=? AND substr(ts,1,10)=?",
+            (uid, target, today),
+        ).fetchone()
+        if already:
+            await q.answer("Вы уже лайкнули этого пользователя сегодня")
+            await show_profile(q, uid)
+            return
+        conn.execute(
+            "INSERT INTO likes(from_id,to_id,ts) VALUES(?,?,?)",
+            (uid, target, datetime.now(timezone.utc).isoformat()),
+        )
         conn.commit()
-        mutual = conn.execute("SELECT 1 FROM likes WHERE from_id=? AND to_id=?",
-                              (target, uid)).fetchone()
+        mutual = conn.execute(
+            "SELECT 1 FROM likes WHERE from_id=? AND to_id=?", (target, uid)
+        ).fetchone()
+
     if u["vip"] != 3:
         db_set(uid, likes_left=u["likes_left"] - 1)
 
@@ -926,15 +1048,17 @@ async def cb_like(update, ctx):
         u2 = db_get_user(target)
         text_me = (
             f"🎉 <b>Взаимный лайк!</b>\n\n"
-            f"<b>Мэтч:</b>\n{other['name']}, {other['age']}, {other['city']}\n"
-            f"@{u2['username'] or '—'}\n\n"
-            f"Вы: {me['name']}, {me['age']}, {me['city']}\n@{u1['username'] or '—'}"
+            f"<b>Мэтч:</b>\n{escape(str(other['name']))}, {escape(str(other['age']))}, {escape(str(other['city']))}\n"
+            f"@{escape(u2['username'] or '—')}\n\n"
+            f"Вы: {escape(str(me['name']))}, {escape(str(me['age']))}, {escape(str(me['city']))}\n"
+            f"@{escape(u1['username'] or '—')}"
         )
         text_other = (
             f"🎉 <b>Взаимный лайк!</b>\n\n"
-            f"<b>Мэтч:</b>\n{me['name']}, {me['age']}, {me['city']}\n"
-            f"@{u1['username'] or '—'}\n\n"
-            f"Вы: {other['name']}, {other['age']}, {other['city']}\n@{u2['username'] or '—'}"
+            f"<b>Мэтч:</b>\n{escape(str(me['name']))}, {escape(str(me['age']))}, {escape(str(me['city']))}\n"
+            f"@{escape(u1['username'] or '—')}\n\n"
+            f"Вы: {escape(str(other['name']))}, {escape(str(other['age']))}, {escape(str(other['city']))}\n"
+            f"@{escape(u2['username'] or '—')}"
         )
         await safe_send(ctx.bot, uid, text_me)
         await safe_send(ctx.bot, target, text_other)
@@ -963,15 +1087,21 @@ async def cb_back_profile(update, ctx):
         return await q.answer("Анкета недоступна", show_alert=True)
     text = (
         f"<b>🍁 Анкета</b>\n\n"
-        f"Имя: {p['name']}\nВозраст: {p['age']}\nГород: {p['city']}\n"
-        f"Диагноз: {p['diagnosis']}\nО себе: {p['about']}"
+        f"Имя: {escape(str(p['name']))}\n"
+        f"Возраст: {escape(str(p['age']))}\n"
+        f"Город: {escape(str(p['city']))}\n"
+        f"Диагноз: {escape(str(p['diagnosis']))}\n"
+        f"О себе: {escape(str(p['about']))}"
     )
     rows = [[
         InlineKeyboardButton("❤️ Лайк", callback_data=f"like:{target}"),
         InlineKeyboardButton("➡️ Дальше", callback_data=f"skip:{target}"),
         InlineKeyboardButton("🚨", callback_data=f"prof_report:{target}"),
     ], [InlineKeyboardButton("◀️ В меню", callback_data="menu:main")]]
-    await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+    try:
+        await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+    except Exception:
+        await q.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
     await q.answer()
 
 
@@ -984,11 +1114,14 @@ async def cb_prof_report(update, ctx):
         return await q.answer("Анкета недоступна", show_alert=True)
     text = (
         f"🚨 <b>Жалоба на анкету</b>\n"
-        f"От: <code>{reporter}</code> @{q.from_user.username or '-'}\n"
+        f"От: <code>{reporter}</code> @{escape(q.from_user.username or '-')}\n"
         f"На: <code>{target}</code>\n\n"
         f"<b>Анкета:</b>\n"
-        f"Имя: {p['name']}\nВозраст: {p['age']}\nГород: {p['city']}\n"
-        f"Диагноз: {p['diagnosis']}\nО себе: {p['about']}"
+        f"Имя: {escape(str(p['name']))}\n"
+        f"Возраст: {escape(str(p['age']))}\n"
+        f"Город: {escape(str(p['city']))}\n"
+        f"Диагноз: {escape(str(p['diagnosis']))}\n"
+        f"О себе: {escape(str(p['about']))}"
     )
     await to_admin(ctx.bot, TOPIC_REPORTS, text, reply_markup=kb_report(target))
     await q.answer("🚨 Жалоба отправлена", show_alert=True)
@@ -1007,11 +1140,15 @@ async def cb_menu_profile(update, ctx):
         f"Лимит символов: {'∞' if vip_char_limit(u['vip']) >= 10**9 else vip_char_limit(u['vip'])}\n"
     )
     if u["anon_until"]:
-        text += f"Анон-доступ до: {u['anon_until'][:16]}\n"
+        text += f"Анон-доступ до: {escape(u['anon_until'][:16])}\n"
     if p:
         text += (
-            f"\n<b>Анкета:</b>\nИмя: {p['name']}\nВозраст: {p['age']}\n"
-            f"Город: {p['city']}\nДиагноз: {p['diagnosis']}\nО себе: {p['about']}"
+            f"\n<b>Анкета:</b>\n"
+            f"Имя: {escape(str(p['name']))}\n"
+            f"Возраст: {escape(str(p['age']))}\n"
+            f"Город: {escape(str(p['city']))}\n"
+            f"Диагноз: {escape(str(p['diagnosis']))}\n"
+            f"О себе: {escape(str(p['about']))}"
         )
     await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb_profile_view())
     await q.answer()
@@ -1020,7 +1157,7 @@ async def cb_menu_profile(update, ctx):
 async def cb_profile_edit(update, ctx):
     q = update.callback_query
     uid = q.from_user.id
-    u = db_get_user(uid)
+    u = db_get_user(uid, q.from_user)
     if u["circle_file_id"]:
         ctx.user_data["edit_text_mode"] = True
         limit = vip_char_limit(u["vip"])
@@ -1038,7 +1175,7 @@ async def cb_profile_edit(update, ctx):
         await q.message.edit_text(
             "✏️ <b>Редактирование анкеты</b>\n\n"
             "Текущая анкета:\n"
-            f"<code>{current}</code>\n\n"
+            f"<code>{escape(current)}</code>\n\n"
             "Отправьте новую анкету строго по шаблону:\n\n"
             f"<code>{PROFILE_TEMPLATE}</code>\n\n"
             f"📌 Лимит: <b>{limit_txt}</b>.\n"
@@ -1225,7 +1362,12 @@ async def cb_app_accept(update, ctx):
         conn.execute("UPDATE profiles SET approved=1, rejected=0 WHERE user_id=?", (uid,))
         conn.commit()
     await q.message.edit_reply_markup(reply_markup=None)
-    await safe_send(ctx.bot, uid, "✅ Ваша анкета одобрена!")
+    await safe_send(ctx.bot, uid, "✅ Ваша анкета одобрена! Теперь вам доступны все функции.")
+    await safe_send(
+        ctx.bot, uid,
+        "🍁 <b>Главное меню</b>",
+        reply_markup=kb_main(uid == ADMIN_ID),
+    )
     await q.answer("Одобрено")
 
 
@@ -1422,9 +1564,9 @@ async def cb_admin_users(update, ctx):
     for r in rows:
         st = "🚫" if r["banned"] else "✅"
         if r["username"]:
-            who = f"@{r['username']}"
+            who = f"@{escape(str(r['username']))}"
         else:
-            who = r["full_name"] or "без имени"
+            who = escape(str(r["full_name"])) if r["full_name"] else "без имени"
         lines.append(f"{st} <code>{r['user_id']}</code> · {who} · VIP{r['vip']}")
     await q.message.edit_text(
         "\n".join(lines),
@@ -1447,6 +1589,7 @@ def main():
 
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE, ban_mw), group=-500)
     app.add_handler(CallbackQueryHandler(ban_cb_mw), group=-500)
+    app.add_handler(CallbackQueryHandler(moderation_mw), group=-490)
 
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^/start"), cmd_start), group=-450)
 
