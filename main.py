@@ -939,12 +939,19 @@ async def anon_relay(update, ctx):
                 reply_to_id = r[0]
 
     try:
-        sent = await ctx.bot.copy_message(
-            chat_id=partner, 
-            from_chat_id=msg.chat.id, 
-            message_id=msg.message_id,
-            reply_to_message_id=reply_to_id
-        )
+        sent = None
+        if msg.voice:
+            sent = await ctx.bot.send_voice(chat_id=partner, voice=msg.voice.file_id, reply_to_message_id=reply_to_id)
+        elif msg.video_note:
+            sent = await ctx.bot.send_video_note(chat_id=partner, video_note=msg.video_note.file_id, reply_to_message_id=reply_to_id)
+        else:
+            sent = await ctx.bot.copy_message(
+                chat_id=partner, 
+                from_chat_id=msg.chat.id, 
+                message_id=msg.message_id,
+                reply_to_message_id=reply_to_id
+            )
+            
         if sent:
             with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
                 conn.execute(
