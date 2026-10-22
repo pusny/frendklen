@@ -457,7 +457,14 @@ def kb_admin_prices():
 async def safe_send(bot, chat_id, text, **kw):
     try:
         return await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, **kw)
-    except Exception:
+    except Exception as e:
+        print(f"ОШИБКА ОТПРАВКИ В АДМИН-ЧАТ (ID: {chat_id}): {e}")
+        if "reply_to_message_id" in kw:
+            kw.pop("reply_to_message_id")
+            try:
+                return await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, **kw)
+            except Exception as e2:
+                print(f"ПОВТОРНАЯ ОШИБКА: {e2}")
         return None
 
 
@@ -762,15 +769,18 @@ async def handle_profile(update, ctx, u, text):
     )
     
     video_msg = None
-    if u["circle_file_id"]:
+    if u.get("circle_file_id"):
         try:
             video_msg = await ctx.bot.send_video_note(
                 ADMIN_CHAT_ID, u["circle_file_id"], **_tk(TOPIC_APPS)
             )
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Ошибка отправки кружка в админ-чат: {e}")
 
-    reply_kw = {"reply_to_message_id": video_msg.message_id} if video_msg else {}
+    reply_kw = {}
+    if video_msg:
+        reply_kw = {"reply_to_message_id": video_msg.message_id}
+        
     sent = await to_admin(ctx.bot, TOPIC_APPS, profile_text, reply_markup=kb_app_review(uid), **reply_kw)
     
     if sent:
@@ -2080,8 +2090,7 @@ async def cb_noop(update, ctx):
 
 
 async def error_handler(update, ctx):
-    pass
-
+    print(f"ОШИБКА БОТА: {ctx.error}")
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
