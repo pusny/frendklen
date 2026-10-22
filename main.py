@@ -46,6 +46,14 @@ CODE_WORDS = ["клён", "листопад", "янтарь", "осень", "в�
 
 PROFILE_TEMPLATE = "Имя: \nВозраст: \nГород: \nДиагноз: \nОписание о себе: "
 
+PRICE_LABELS = {
+    "vip1": "🍁 VIP 1 (Низкий)",
+    "vip2": "🍁 VIP 2 (Средний)",
+    "vip3": "🍁 VIP 3 (Высокий)",
+    "anon": "💬 Доступ в анон",
+    "unban": "🔓 Разбан"
+}
+
 
 def _tk(topic):
     return {"message_thread_id": topic} if topic > 0 else {}
@@ -132,7 +140,6 @@ def _init_db():
         except Exception:
             pass
 
-        # Конвертируем старые даты (2100+) в 'forever'
         conn.execute("UPDATE users SET anon_until='forever' WHERE anon_until LIKE '21%'")
         conn.execute("UPDATE users SET vip_until='forever' WHERE vip_until LIKE '21%'")
 
@@ -433,7 +440,7 @@ def kb_admin():
 
 def kb_admin_prices():
     keys = ["vip1", "vip2", "vip3", "anon", "unban"]
-    rows = [[InlineKeyboardButton(f"✏️ {k} — {db_get_price(k)}₽", callback_data=f"admin:price_set:{k}")]
+    rows = [[InlineKeyboardButton(f"✏️ {PRICE_LABELS[k]} — {db_get_price(k)}₽", callback_data=f"admin:price_set:{k}")]
             for k in keys]
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="admin:main")])
     return InlineKeyboardMarkup(rows)
@@ -877,6 +884,7 @@ async def private_message(update, ctx):
     if msg.text:
         await msg.reply_text(
             "🍁 <b>Используйте меню для навигации:</b>",
+            parse_mode=ParseMode.HTML,
             reply_markup=kb_main(uid == ADMIN_ID),
         )
     raise ApplicationHandlerStop
@@ -1046,7 +1054,7 @@ async def handle_admin_input(update, ctx):
             key = args[0]
             val = int(msg.text.strip())
             db_set_price(key, val)
-            await msg.reply_text(f"✅ Цена {key} успешно изменена на {val}₽", reply_markup=kb_admin_prices())
+            await msg.reply_text(f"✅ Цена {PRICE_LABELS.get(key, key)} успешно изменена на {val}₽", reply_markup=kb_admin_prices())
     except Exception:
         await msg.reply_text("❌ Ошибка формата ввода. Попробуйте снова.", reply_markup=kb_admin())
 
@@ -1967,7 +1975,7 @@ async def cb_admin_price_set(update, ctx):
     key = q.data.split(":")[2]
     ctx.user_data["admin_input"] = ("price", key)
     try:
-        await q.message.edit_text(f"Введите новую цену для <b>{key}</b>:", parse_mode=ParseMode.HTML,
+        await q.message.edit_text(f"Введите новую цену для <b>{PRICE_LABELS.get(key, key)}</b>:", parse_mode=ParseMode.HTML,
                                   reply_markup=kb_back("admin:prices"))
     except Exception:
         pass
