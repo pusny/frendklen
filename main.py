@@ -1049,7 +1049,7 @@ async def handle_admin_input(update, ctx):
                 conn.execute("DELETE FROM anon_queue WHERE user_id=?", (uid,))
                 conn.execute("DELETE FROM anon_relay_msgs WHERE sender_id=? OR partner_id=?", (uid, uid))
                 conn.commit()
-            await msg.reply_text(f"🗑 Анкета и данные пользователя <code>{uid}</code> полностью удалены.", reply_markup=kb_admin())
+            await msg.reply_text(f"🗑 Анкета и данные пользователя <code>{uid}</code> полностью удалены.", parse_mode=ParseMode.HTML, reply_markup=kb_admin())
             await safe_send(ctx.bot, uid, "🗑 <b>Ваша анкета и данные были удалены администратором.</b>\n\n👉 Напишите /start, чтобы зарегистрироваться заново.")
         elif kind == "give_vip_uid":
             uid = int(msg.text.strip())
