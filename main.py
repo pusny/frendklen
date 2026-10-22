@@ -933,10 +933,17 @@ async def admin_chat_handler(update, ctx):
         return
 
     if ctx.user_data.get("ticket_reply_to") and msg.text:
-        uid = ctx.user_data.pop("ticket_reply_to")
-        await safe_send(ctx.bot, uid, f"📩 <b>Ответ поддержки:</b>\n\n{escape(msg.text)}")
-        await msg.reply_text("✅ Отправлено.")
-        raise ApplicationHandlerStop
+        is_correct_thread = False
+        if TOPIC_TICKETS == 0:
+            is_correct_thread = True
+        elif msg.message_thread_id == TOPIC_TICKETS:
+            is_correct_thread = True
+            
+        if is_correct_thread:
+            uid = ctx.user_data.pop("ticket_reply_to")
+            await safe_send(ctx.bot, uid, f"📩 <b>Ответ поддержки:</b>\n\n{escape(msg.text)}")
+            await msg.reply_text("✅ Отправлено.")
+            raise ApplicationHandlerStop
 
     if msg.reply_to_message:
         target = db_get_admin_msg(msg.reply_to_message.message_id)
