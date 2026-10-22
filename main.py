@@ -737,6 +737,7 @@ async def handle_profile(update, ctx, u, text):
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("🔄 Проверить статус", callback_data="menu:main"),
         ]]),
+        parse_mode=ParseMode.HTML
     )
 
     profile_text = (
@@ -1063,7 +1064,7 @@ async def cb_agree_yes(update, ctx):
     q = update.callback_query
     uid = q.from_user.id
     db_set(uid, agreed=1)
-    await q.message.edit_text("✅ <b>Соглашение принято.</b>")
+    await q.message.edit_text("✅ <b>Соглашение принято.</b>", parse_mode=ParseMode.HTML)
     await ask_phone(q.message)
     await q.answer()
 
@@ -1072,7 +1073,7 @@ async def cb_agree_no(update, ctx):
     q = update.callback_query
     uid = q.from_user.id
     db_set(uid, banned=1, ban_reason="Отказ от соглашения")
-    await q.message.edit_text("❌ <b>Вы отказались от соглашения.</b>")
+    await q.message.edit_text("❌ <b>Вы отказались от соглашения.</b>", parse_mode=ParseMode.HTML)
     await notify_user(ctx.bot, uid, BAN_ON_REFUSE)
     await q.answer()
 
