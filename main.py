@@ -96,6 +96,13 @@ def _init_db():
             user_a INTEGER, user_b INTEGER, ts TEXT,
             PRIMARY KEY (user_a, user_b)
         );
+        CREATE TABLE IF NOT EXISTS anon_relay_msgs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender_id INTEGER,
+            sender_msg_id INTEGER,
+            partner_id INTEGER,
+            partner_msg_id INTEGER
+        );
         CREATE TABLE IF NOT EXISTS prices (key TEXT PRIMARY KEY, val INTEGER);
         CREATE TABLE IF NOT EXISTS admin_msgs (msg_id INTEGER PRIMARY KEY, user_id INTEGER, mtype TEXT);
         CREATE TABLE IF NOT EXISTS skips (id INTEGER PRIMARY KEY AUTOINCREMENT, from_id INTEGER, to_id INTEGER, ts TEXT);
@@ -137,6 +144,7 @@ def _init_db():
             conn.execute("CREATE TABLE IF NOT EXISTS likes (id INTEGER PRIMARY KEY AUTOINCREMENT, from_id INTEGER, to_id INTEGER, ts TEXT)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_likes_ft ON likes(from_id, to_id, ts)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_skips_ft ON skips(from_id, to_id, ts)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_relay ON anon_relay_msgs(partner_id, partner_msg_id)")
         except Exception:
             pass
 
@@ -908,6 +916,7 @@ async def anon_relay(update, ctx):
                 "DELETE FROM anon_pairs WHERE (user_a=? AND user_b=?) OR (user_a=? AND user_b=?)",
                 (uid, partner, partner, uid),
             )
+            conn.execute("DELETE FROM anon_relay_msgs WHERE sender_id=? OR partner_id=?", (uid, uid))
             conn.commit()
         price = db_get_price("anon")
         await safe_send(
@@ -918,8 +927,31 @@ async def anon_relay(update, ctx):
         )
         await safe_send(ctx.bot, partner, "🛑 Собеседник отключился (закончилось время).", reply_markup=kb_anon())
         raise ApplicationHandlerStop
+
+    reply_to_id = None
+    if msg.reply_to_message:
+        with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+            r = conn.execute(
+                "SELECT sender_msg_id FROM anon_relay_msgs WHERE partner_id=? AND partner_msg_id=?",
+                (uid, msg.reply_to_message.message_id)
+            ).fetchone()
+            if r:
+                reply_to_id = r[0]
+
     try:
-        await ctx.bot.copy_message(partner, msg.chat.id, msg.message_id)
+        sent = await ctx.bot.copy_message(
+            chat_id=partner, 
+            from_chat_id=msg.chat.id, 
+            message_id=msg.message_id,
+            reply_to_message_id=reply_to_id
+        )
+        if sent:
+            with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+                conn.execute(
+                    "INSERT INTO anon_relay_msgs(sender_id, sender_msg_id, partner_id, partner_msg_id) VALUES(?,?,?,?)",
+                    (uid, msg.message_id, partner, sent.message_id)
+                )
+                conn.commit()
     except Exception:
         pass
     raise ApplicationHandlerStop
@@ -1001,6 +1033,7 @@ async def handle_admin_input(update, ctx):
                 conn.execute("DELETE FROM skips WHERE from_id=? OR to_id=?", (uid, uid))
                 conn.execute("DELETE FROM anon_pairs WHERE user_a=? OR user_b=?", (uid, uid))
                 conn.execute("DELETE FROM anon_queue WHERE user_id=?", (uid,))
+                conn.execute("DELETE FROM anon_relay_msgs WHERE sender_id=? OR partner_id=?", (uid, uid))
                 conn.commit()
             await msg.reply_text(f"🗑 Анкета и данные пользователя <code>{uid}</code> полностью удалены.", reply_markup=kb_admin())
             await safe_send(ctx.bot, uid, "🗑 <b>Ваша анкета и данные были удалены администратором.</b>\n\n👉 Напишите /start, чтобы зарегистрироваться заново.")
@@ -1687,6 +1720,7 @@ async def cb_anon_stop(update, ctx):
                 "DELETE FROM anon_pairs WHERE (user_a=? AND user_b=?) OR (user_a=? AND user_b=?)",
                 (uid, partner, partner, uid),
             )
+        conn.execute("DELETE FROM anon_relay_msgs WHERE sender_id=? OR partner_id=?", (uid, uid))
         conn.commit()
     try:
         await q.message.edit_text("🛑 <b>Чат завершён.</b>", parse_mode=ParseMode.HTML, reply_markup=kb_back())
