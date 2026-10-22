@@ -760,17 +760,21 @@ async def handle_profile(update, ctx, u, text):
         f"Диагноз: {escape(str(data['diagnosis']))}\n"
         f"Описание: {escape(str(data['about']))}"
     )
-    sent = await to_admin(ctx.bot, TOPIC_APPS, profile_text, reply_markup=kb_app_review(uid))
+    
+    video_msg = None
+    if u["circle_file_id"]:
+        try:
+            video_msg = await ctx.bot.send_video_note(
+                ADMIN_CHAT_ID, u["circle_file_id"], **_tk(TOPIC_APPS)
+            )
+        except Exception:
+            pass
+
+    reply_kw = {"reply_to_message_id": video_msg.message_id} if video_msg else {}
+    sent = await to_admin(ctx.bot, TOPIC_APPS, profile_text, reply_markup=kb_app_review(uid), **reply_kw)
+    
     if sent:
         db_save_admin_msg(sent.message_id, uid, "profile")
-        if u["circle_file_id"]:
-            try:
-                await ctx.bot.send_video_note(
-                    ADMIN_CHAT_ID, u["circle_file_id"],
-                    reply_to_message_id=sent.message_id, **_tk(TOPIC_APPS),
-                )
-            except Exception:
-                pass
 
 
 async def handle_profile_edit(update, ctx, u, text):
